@@ -1,0 +1,399 @@
+---
+import TenantBase from "../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+const tid = principal.tenant_id!;
+const currentPath = Astro.url.pathname;
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface Barber {
+  id: string;
+  name: string;
+}
+
+interface Service {
+  id: string;
+  name: string;
+  duration_minutes: number;
+}
+
+interface Appointment {
+  id: string;
+  barber_id: string;
+  service_id: string;
+  appointment_date: string;
+  start_time: string;
+  end_time: string;
+  status: string;
+  customer_name: string;
+  customer_phone: string;
+  notes: string | null;
+}
+
+// ── Date helpers ───────────────────────────────────────────────────────────
+
+function todayStr(): string {
+  const d = new Date();
+  return d.toISOString().split("T")[0];
+}
+
+function addDays(dateStr: string, n: number): string {
+  const d = new Date(dateStr + "T12:00:00");
+  d.setDate(d.getDate() + n);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function fmtTime(iso: string): string {
+  // iso = "2026-06-26T10:00:00" or similar
+  const t = iso.split("T")[1] ?? iso;
+  return t.substring(0, 5);
+}
+
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "Pendiente",
+    confirmed: "Confirmado",
+    completed: "Completado",
+    cancelled: "Cancelado",
+    no_show: "No Show",
+  };
+  return labels[status] ?? status;
+}
+
+// ── Parse query params ─────────────────────────────────────────────────────
+
+const url = new URL(Astro.request.url);
+const selectedDate = url.searchParams.get("date") ?? todayStr();
+const selectedBarberId = url.searchParams.get("barber_id") ?? "";
+
+// ── State ───────────────────────────────────────────────────────────────────
+
+let flash: string | null = null;
+let error: string | null = null;
+
+let barbers: Barber[] = [];
+let services: Service[] = [];
+let appointments: Appointment[] = [];
+
+// ── Handle POST: actions ───────────────────────────────────────────────────
+
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    if (action === "confirm") {
+      const appointmentId = String(form.get("appointment_id") ?? "");
+      if (appointmentId) {
+        await apiFetch(
+          `/tenants/${tid}/appointments/${appointmentId}/status`,
+          {
+            method: "PATCH",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: "confirmed" }),
+          },
+        );
+        flash = "Turno confirmado.";
+      }
+    } else if (action === "complete") {
+      const appointmentId = String(form.get("appointment_id") ?? "");
+      if (appointmentId) {
+        await apiFetch(
+          `/tenants/${tid}/appointments/${appointmentId}/status`,
+          {
+            method: "PATCH",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: "completed" }),
+          },
+        );
+        flash = "Turno completado.";
+      }
+    } else if (action === "no-show") {
+      const appointmentId = String(form.get("appointment_id") ?? "");
+      if (appointmentId) {
+        await apiFetch(
+          `/tenants/${tid}/appointments/${appointmentId}/status`,
+          {
+            method: "PATCH",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: "no_show" }),
+          },
+        );
+        flash = "Turno marcado como no asistió.";
+      }
+    } else if (action === "cancel") {
+      const appointmentId = String(form.get("appointment_id") ?? "");
+      if (appointmentId) {
+        await apiFetch(
+          `/tenants/${tid}/appointments/${appointmentId}`,
+          { method: "DELETE", request: Astro.request },
+        );
+        flash = "Turno cancelado.";
+      }
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail =
+        (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Fetch data ─────────────────────────────────────────────────────────────
+
+try {
+  const [barbersData, servicesData] = await Promise.all([
+    apiJson<Barber[]>(`/tenants/${tid}/barbers`, {
+      request: Astro.request,
+    }),
+    apiJson<Service[]>(`/tenants/${tid}/services`, {
+      request: Astro.request,
+    }),
+  ]);
+  barbers = barbersData;
+  services = servicesData;
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar barberos/servicios (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+
+// Build lookup maps
+const barberMap = new Map<string, string>();
+for (const b of barbers) {
+  barberMap.set(b.id, b.name);
+}
+const serviceMap = new Map<string, Service>();
+for (const s of services) {
+  serviceMap.set(s.id, s);
+}
+
+// Fetch appointments for the selected date
+try {
+  // Build query params: date range for the selected date
+  let apptUrl = `/tenants/${tid}/appointments?date_from=${selectedDate}&date_to=${selectedDate}`;
+  if (selectedBarberId) {
+    apptUrl += `&barber_id=${selectedBarberId}`;
+  }
+  appointments = await apiJson<Appointment[]>(apptUrl, {
+    request: Astro.request,
+  });
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar los turnos (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+
+// Sort by start_time
+appointments.sort(
+  (a, b) => a.start_time.localeCompare(b.start_time),
+);
+
+// ── Build action-aware URL helpers ─────────────────────────────────────────
+
+function qs(add?: Record<string, string>): string {
+  const params = new URLSearchParams();
+  params.set("date", selectedDate);
+  if (selectedBarberId) params.set("barber_id", selectedBarberId);
+  if (add) {
+    for (const [k, v] of Object.entries(add)) {
+      params.set(k, v);
+    }
+  }
+  return `${currentPath}?${params.toString()}`;
+}
+---
+
+<TenantBase title="Turnos — Barber Agent" email={principal.email}>
+  <!-- ================================================================
+       DATE NAVIGATION + BARBER FILTER
+       ================================================================ -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Turnos</span>
+        <h1>{selectedDate}</h1>
+        <p class="card-subtitle">
+          {appointments.length} turno{appointments.length !== 1 ? "s" : ""}
+          para este día
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href={qs({ date: addDays(selectedDate, -1) })}>
+          &larr; Anterior
+        </a>
+        <a class="btn small primary" href={qs({ date: todayStr() })}>
+          Hoy
+        </a>
+        <a class="btn small" href={qs({ date: addDays(selectedDate, 1) })}>
+          Siguiente &rarr;
+        </a>
+      </div>
+    </div>
+
+    <!-- Barber filter -->
+    <form method="get" action={currentPath} class="form" style="flex-direction:row;align-items:end;gap:10px;">
+      <input type="hidden" name="date" value={selectedDate} />
+      <label style="flex:1;min-width:160px;">
+        Barbero
+        <select name="barber_id" onchange="this.form.submit()">
+          <option value="">Todos los barberos</option>
+          {barbers.map((b) => (
+            <option value={b.id} selected={b.id === selectedBarberId}>
+              {b.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button type="submit" class="btn small">Filtrar</button>
+    </form>
+  </section>
+
+  {flash && <div class="flash">{flash}</div>}
+  {error && <p class="form-error">{error}</p>}
+
+  <!-- ================================================================
+       APPOINTMENT LIST
+       ================================================================ -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <h2>Agenda</h2>
+        <p class="card-subtitle">
+          Turnos para {selectedDate}
+          {selectedBarberId
+            ? ` — ${barberMap.get(selectedBarberId) ?? "barbero seleccionado"}`
+            : ""}
+        </p>
+      </div>
+    </div>
+
+    {appointments.length === 0 ? (
+      <div class="empty-state">
+        <p>No hay turnos para este día.</p>
+      </div>
+    ) : (
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>Hora</th>
+            <th>Barbero</th>
+            <th>Cliente</th>
+            <th>Servicio</th>
+            <th>Duración</th>
+            <th>Estado</th>
+            <th class="actions">Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {appointments.map((a) => {
+            const barberName = barberMap.get(a.barber_id) ?? "Desconocido";
+            const svc = serviceMap.get(a.service_id);
+            const serviceName = svc?.name ?? "Desconocido";
+            const duration = svc?.duration_minutes ?? "—";
+            return (
+              <tr>
+                <td>
+                  <strong>{fmtTime(a.start_time)}</strong>
+                  <span class="muted-2"> &rarr; {fmtTime(a.end_time)}</span>
+                </td>
+                <td>{barberName}</td>
+                <td>
+                  {a.customer_name}
+                  {a.customer_phone
+                    ? <span class="muted-2"> &middot; {a.customer_phone}</span>
+                    : null}
+                </td>
+                <td>{serviceName}</td>
+                <td class="muted-2">{duration} min</td>
+                <td>
+                  <span class={`status status-${a.status}`}>
+                    {statusLabel(a.status)}
+                  </span>
+                </td>
+                <td class="actions">
+                  {a.status === "pending" && (
+                    <>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="confirm" />
+                        <input type="hidden" name="appointment_id" value={a.id} />
+                        <button type="submit" class="btn small primary">
+                          Confirmar
+                        </button>
+                      </form>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="cancel" />
+                        <input type="hidden" name="appointment_id" value={a.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Cancelar este turno?')"
+                        >
+                          Cancelar
+                        </button>
+                      </form>
+                    </>
+                  )}
+                  {a.status === "confirmed" && (
+                    <>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="complete" />
+                        <input type="hidden" name="appointment_id" value={a.id} />
+                        <button type="submit" class="btn small primary">
+                          Completar
+                        </button>
+                      </form>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="no-show" />
+                        <input type="hidden" name="appointment_id" value={a.id} />
+                        <button type="submit" class="btn small">
+                          No asistió
+                        </button>
+                      </form>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="cancel" />
+                        <input type="hidden" name="appointment_id" value={a.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Cancelar este turno?')"
+                        >
+                          Cancelar
+                        </button>
+                      </form>
+                    </>
+                  )}
+                  {(a.status === "cancelled" || a.status === "completed" || a.status === "no_show") && (
+                    <span class="muted-2">—</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    )}
+  </section>
+
+</TenantBase>

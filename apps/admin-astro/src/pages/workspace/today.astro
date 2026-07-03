@@ -1,0 +1,339 @@
+---
+import WorkspaceBase from "../../layouts/WorkspaceBase.astro";
+import { getTenantPrincipal } from "../../lib/session";
+import { apiJson, apiFetch, ApiError } from "../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/workspace/login");
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface BarberBrief {
+  id: string;
+  name: string;
+  is_active: boolean;
+}
+
+interface BarbersList extends Array<BarberBrief> {}
+
+interface AppointmentData {
+  id: string;
+  customer_name: string;
+  customer_phone: string;
+  service_name: string;
+  service_duration: number;
+  start_time: string;
+  end_time: string;
+  status: string;
+  notes: string | null;
+}
+
+interface BarberTodayData {
+  barber: BarberBrief;
+  target_date: string;
+  appointments: AppointmentData[];
+  total: number;
+  pending: number;
+  confirmed: number;
+  completed: number;
+  cancelled: number;
+}
+
+// ── State ───────────────────────────────────────────────────────────────────
+
+const tenantId = principal.tenant_id;
+const today = new Date();
+const todayStr = today.toISOString().split("T")[0];
+
+// If the principal has a linked barber, auto-select it — no selector needed.
+const linkedBarberId = principal.barber_id;
+const linkedBarberName = principal.barber_name;
+
+let selectedBarberId: string | null = linkedBarberId ?? null;
+let selectedBarberName: string | null = linkedBarberName ?? null;
+let statusFlash: string | null = null;
+let statusError: string | null = null;
+
+// Handle POST (form submission for status changes or barber selection)
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "").trim();
+
+  if (action === "set_status") {
+    const apptId = String(form.get("appointment_id") ?? "").trim();
+    const newStatus = String(form.get("new_status") ?? "").trim();
+    if (apptId && newStatus) {
+      try {
+        await apiFetch(`/tenants/${tenantId}/appointments/${apptId}/status`, {
+          method: "PATCH",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ status: newStatus }),
+        });
+        statusFlash = `Turno marcado como ${newStatus}.`;
+      } catch (err: unknown) {
+        if (err instanceof ApiError) {
+          statusError = `Error al actualizar estado (${err.status}).`;
+        } else {
+          statusError = "No se pudo contactar la API.";
+        }
+      }
+    }
+  } else if (action === "select_barber") {
+    selectedBarberId = String(form.get("barber_id") ?? "").trim() || null;
+  }
+}
+
+// Also allow GET with ?barber_id= for deep linking (override linked barber)
+if (!selectedBarberId) {
+  selectedBarberId = Astro.url.searchParams.get("barber_id") ?? linkedBarberId ?? null;
+}
+
+// ── Data fetching ───────────────────────────────────────────────────────────
+
+// Fetch barbers list (only needed if no linked barber)
+let barbers: BarberBrief[] = [];
+let barbersError: string | null = null;
+if (!linkedBarberId) {
+  try {
+    barbers = await apiJson<BarbersList>(
+      `/tenants/${tenantId}/barbers`,
+      { request: Astro.request },
+    );
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      barbersError = `No se pudieron cargar los barberos (${err.status}).`;
+    } else {
+      barbersError = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// Auto-select first active barber when no linked barber and no selection
+if (!selectedBarberId && barbers.length > 0) {
+  const firstActive = barbers.find((b) => b.is_active) ?? barbers[0];
+  selectedBarberId = firstActive.id;
+  selectedBarberName = firstActive.name;
+}
+
+// Fetch today's data
+let todayData: BarberTodayData | null = null;
+let todayError: string | null = null;
+
+if (selectedBarberId) {
+  try {
+    todayData = await apiJson<BarberTodayData>(
+      `/tenants/${tenantId}/workspace/today?barber_id=${selectedBarberId}&date=${todayStr}`,
+      { request: Astro.request },
+    );
+    selectedBarberName = todayData.barber.name;
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      todayError = `No se pudo cargar la agenda (${err.status}).`;
+    } else {
+      todayError = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "Pendiente",
+    confirmed: "Confirmado",
+    completed: "Completado",
+    cancelled: "Cancelado",
+    no_show: "No asistió",
+  };
+  return labels[status] ?? status;
+}
+
+function fmtTime(raw: string): string {
+  try {
+    const d = new Date(raw);
+    return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch {
+    return raw.substring(0, 5);
+  }
+}
+
+function statusClass(status: string): string {
+  return `status status-${status}`;
+}
+
+function isActionable(status: string): boolean {
+  return status === "pending" || status === "confirmed";
+}
+
+const url = Astro.url.pathname;
+const title = linkedBarberName
+  ? `Hoy — ${linkedBarberName}`
+  : "Hoy — Espacio del barbero";
+---
+
+<WorkspaceBase title={title} email={principal.email} barberName={selectedBarberName} photoUrl={principal.photo_url ?? null}>
+  <!-- ── Barber Selector (only shown when no linked barber) ────────── -->
+  {!linkedBarberId && (
+    <section class="ws-card">
+      <div class="ws-header">
+        <div>
+          <span class="ws-eyebrow">Barbero</span>
+          <h1>Agenda de hoy</h1>
+          <p class="ws-subtitle">{todayStr}</p>
+        </div>
+      </div>
+
+      {barbersError && <p class="form-error">{barbersError}</p>}
+
+      <form method="post" action={url} class="ws-selector-form">
+        <label class="ws-selector-label">
+          <select name="barber_id" class="ws-select" onchange="this.form.submit()">
+            <option value="">-- Seleccionar barbero --</option>
+            {barbers.map((b) => (
+              <option value={b.id} selected={b.id === selectedBarberId}>
+                {b.name} {b.is_active ? "" : "(inactivo)"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <input type="hidden" name="_action" value="select_barber" />
+        <noscript>
+          <button type="submit" class="btn primary small">Ir</button>
+        </noscript>
+      </form>
+    </section>
+  )}
+
+  <!-- ── Linked barber header ─────────────────────────────────────── -->
+  {linkedBarberId && (
+    <section class="ws-card">
+      <div class="ws-header">
+        <div>
+          <span class="ws-eyebrow">Bienvenido{linkedBarberName ? `, ${linkedBarberName}` : ""}</span>
+          <h1>Tu agenda</h1>
+          <p class="ws-subtitle">{todayStr}</p>
+        </div>
+      </div>
+    </section>
+  )}
+
+  <!-- ── Flash/Error messages ─────────────────────────────────────── -->
+  {statusFlash && <div class="flash">{statusFlash}</div>}
+  {statusError && <p class="form-error">{statusError}</p>}
+
+  <!-- ── KPI Cards ─────────────────────────────────────────────────── -->
+  {todayData && (
+    <section class="ws-card">
+      <div class="ws-kpi-row">
+        <div class="ws-kpi">
+          <span class="ws-kpi-value">{todayData.total}</span>
+          <span class="ws-kpi-label">Hoy</span>
+        </div>
+        <div class="ws-kpi">
+          <span class="ws-kpi-value ws-kpi-pending">{todayData.pending}</span>
+          <span class="ws-kpi-label">Pendientes</span>
+        </div>
+        <div class="ws-kpi">
+          <span class="ws-kpi-value ws-kpi-confirmed">{todayData.confirmed}</span>
+          <span class="ws-kpi-label">Confirmados</span>
+        </div>
+        <div class="ws-kpi">
+          <span class="ws-kpi-value ws-kpi-completed">{todayData.completed}</span>
+          <span class="ws-kpi-label">Completados</span>
+        </div>
+      </div>
+    </section>
+  )}
+
+  <!-- ── Error state ──────────────────────────────────────────────── -->
+  {todayError && <p class="form-error">{todayError}</p>}
+
+  {selectedBarberId && !todayData && !todayError && (
+    <section class="ws-card">
+      <p class="ws-empty">Cargando...</p>
+    </section>
+  )}
+
+  <!-- ── Empty state ──────────────────────────────────────────────── -->
+  {todayData && todayData.appointments.length === 0 && (
+    <section class="ws-card">
+      <div class="ws-empty-state">
+        <p>No hay turnos agendados para hoy.</p>
+        <p class="ws-empty-hint">¡Disfruta tu día!</p>
+      </div>
+    </section>
+  )}
+
+  <!-- ── Appointments ──────────────────────────────────────────────── -->
+  {todayData && todayData.appointments.length > 0 && (
+    <section class="ws-card">
+      <div class="ws-card-head">
+        <h2>Turnos</h2>
+        <span class="ws-count">{todayData.appointments.length}</span>
+      </div>
+
+      <div class="ws-appt-list">
+        {todayData.appointments.map((a) => (
+          <div class="ws-appt">
+            <div class="ws-appt-time">
+              <span class="ws-appt-time-value">{fmtTime(a.start_time)}</span>
+              <span class="ws-appt-duration">{a.service_duration}min</span>
+            </div>
+            <div class="ws-appt-body">
+              <div class="ws-appt-customer">
+                <strong>{a.customer_name}</strong>
+                <span class="ws-appt-phone">{a.customer_phone}</span>
+              </div>
+              <div class="ws-appt-meta">
+                <span class="ws-appt-service">{a.service_name}</span>
+                <span class={statusClass(a.status)}>{statusLabel(a.status)}</span>
+              </div>
+              {a.notes && (
+                <p class="ws-appt-notes">{a.notes}</p>
+              )}
+
+              <!-- ── Action buttons (for actionable statuses only) ── -->
+              {isActionable(a.status) && (
+                <div class="ws-appt-actions" style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
+                  <form method="post" action={url} style="display:inline;">
+                    <input type="hidden" name="_action" value="set_status" />
+                    <input type="hidden" name="appointment_id" value={a.id} />
+                    <input type="hidden" name="new_status" value="completed" />
+                    <button type="submit" class="btn primary small" style="font-size:12px; padding:4px 10px;">
+                      Completar
+                    </button>
+                  </form>
+                  <form method="post" action={url} style="display:inline;">
+                    <input type="hidden" name="_action" value="set_status" />
+                    <input type="hidden" name="appointment_id" value={a.id} />
+                    <input type="hidden" name="new_status" value="no_show" />
+                    <button type="submit" class="btn danger small" style="font-size:12px; padding:4px 10px;">
+                      No asistió
+                    </button>
+                  </form>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )}
+
+  <!-- ── Links ─────────────────────────────────────────────────────── -->
+  <section class="ws-card ws-footer-card">
+    <div class="ws-footer-links">
+      <a href="/workspace/today" class="btn small ghost">Actualizar</a>
+      <a href="/workspace/profile" class="btn small ghost">Mi perfil</a>
+      {linkedBarberId && (
+        <span class="ws-barber-badge" style="font-size:12px; color:var(--muted); padding:4px 0;">
+          Barbero vinculado: {linkedBarberName || "—"}
+        </span>
+      )}
+      <a href="/workspace/logout" class="btn small ghost">Cerrar sesión</a>
+    </div>
+  </section>
+</WorkspaceBase>

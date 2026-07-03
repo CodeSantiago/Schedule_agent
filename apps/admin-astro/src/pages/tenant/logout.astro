@@ -1,0 +1,18 @@
+---
+import { clearTenantSessionCookie } from "../../lib/session";
+import { apiFetch } from "../../lib/api";
+
+if (Astro.request.method === "POST") {
+  // Attempt to revoke the token server-side (best-effort).
+  try {
+    await apiFetch("/tenants/auth/logout", {
+      method: "POST",
+      request: Astro.request,
+    });
+  } catch {
+    // Token revocation is best-effort; clear the cookie regardless.
+  }
+  clearTenantSessionCookie(Astro.cookies);
+}
+return Astro.redirect("/tenant/login");
+---

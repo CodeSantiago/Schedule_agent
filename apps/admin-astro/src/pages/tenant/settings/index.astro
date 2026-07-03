@@ -1,0 +1,693 @@
+---
+import TenantBase from "../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+interface OperationalSettings {
+  bot_enabled: boolean;
+  closed_dates: string[];
+}
+
+interface BotConfigData {
+  greeting_text: string;
+  behavior_notes: string;
+  display_name: string;
+  contact_phone: string;
+  booking_notes: string;
+  location: string;
+  hours: string;
+}
+
+interface AuditLogEntry {
+  id: string;
+  event_type: string;
+  level: string;
+  message: string;
+  actor_scope: string | null;
+  actor_id: string | null;
+  changed_fields: Record<string, unknown> | null;
+  details: Record<string, unknown>;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+interface AuditLogList {
+  entries: AuditLogEntry[];
+  total: number;
+}
+
+interface SheetsConfig {
+  id: string;
+  kind: string;
+  label: string;
+  provider_name: string;
+  credentials: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  is_active: boolean;
+}
+
+interface DataSettings {
+  source_of_truth: string;
+  sync_mode: string;
+  sheets_connected: boolean;
+}
+
+interface IdentitySettings {
+  mode: string;
+}
+
+let identitySettings: IdentitySettings = { mode: "full_name" };
+let identitySettingsError: string | null = null;
+
+let ops: OperationalSettings = { bot_enabled: true, closed_dates: [] };
+let cfg: BotConfigData = {
+  greeting_text: "",
+  behavior_notes: "",
+  display_name: "",
+  contact_phone: "",
+  booking_notes: "",
+  location: "",
+  hours: "",
+};
+let dataSettings: DataSettings = { source_of_truth: "database", sync_mode: "manual", sheets_connected: false };
+let dataSettingsError: string | null = null;
+let auditLogs: AuditLogEntry[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+
+// ── Sheets config state ──────────────────────────────────────────────
+let sheetsConfig: SheetsConfig | null = null;
+let sheetsConfigError: string | null = null;
+// Form values (pre-filled from sheetsConfig or defaults).
+let sheetsFormLabel = "";
+let sheetsFormApiKey = "";
+let sheetsFormSpreadsheetId = "";
+let sheetsFormSheetName = "Sheet1";
+let sheetsFormRange = "A1:Z";
+
+const url = Astro.url.pathname;
+
+// ── Handle POST ───────────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    if (action === "ops") {
+      const botEnabled = String(form.get("bot_enabled") ?? "false") === "on";
+      const closedRaw = String(form.get("closed_dates") ?? "").trim();
+      const closedDates = closedRaw
+        ? closedRaw.split(",").map((d) => d.trim()).filter(Boolean)
+        : [];
+      await apiFetch(`/tenants/${principal.tenant_id}/settings/operations`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ bot_enabled: botEnabled, closed_dates: closedDates }),
+      });
+      flash = "Configuración guardada.";
+    } else if (action === "config") {
+      const greetingText = String(form.get("greeting_text") ?? "");
+      const behaviorNotes = String(form.get("behavior_notes") ?? "");
+      const displayName = String(form.get("display_name") ?? "");
+      const contactPhone = String(form.get("contact_phone") ?? "");
+      const bookingNotes = String(form.get("booking_notes") ?? "");
+      const location = String(form.get("location") ?? "");
+      const hours = String(form.get("hours") ?? "");
+      await apiFetch(`/tenants/${principal.tenant_id}/settings/config`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          greeting_text: greetingText,
+          behavior_notes: behaviorNotes,
+          display_name: displayName,
+          contact_phone: contactPhone,
+          booking_notes: bookingNotes,
+          location,
+          hours,
+        }),
+      });
+      flash = "Configuración del bot y negocio guardada.";
+    } else if (action === "data") {
+      const sourceOfTruth = String(form.get("source_of_truth") ?? "database");
+      const syncMode = String(form.get("sync_mode") ?? "manual");
+      await apiFetch(`/tenants/${principal.tenant_id}/settings/data`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ source_of_truth: sourceOfTruth, sync_mode: syncMode }),
+      });
+      flash = "Configuración de datos e integraciones guardada.";
+    } else if (action === "sheets") {
+      const label = String(form.get("sheets_label") ?? "").trim();
+      const apiKey = String(form.get("sheets_api_key") ?? "").trim();
+      const spreadsheetId = String(form.get("sheets_spreadsheet_id") ?? "").trim();
+      const sheetName = String(form.get("sheets_sheet_name") ?? "Sheet1").trim();
+      const range = String(form.get("sheets_range") ?? "A1:Z").trim();
+      const isActive = String(form.get("sheets_is_active") ?? "false") === "on";
+
+      if (!label) {
+        error = "La etiqueta es obligatoria.";
+      } else {
+        const credentials: Record<string, unknown> = {};
+        if (apiKey) credentials["api_key"] = apiKey;
+        const settings: Record<string, unknown> = {
+          spreadsheet_id: spreadsheetId,
+          sheet_name: sheetName,
+          range: range,
+        };
+
+        await apiFetch(`/tenants/${principal.tenant_id}/sheets-config`, {
+          method: "PUT",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            label,
+            credentials,
+            settings,
+            is_active: isActive,
+          }),
+        });
+        flash = "Configuración de Sheets guardada.";
+      }
+    } else if (action === "identity") {
+      const mode = String(form.get("identity_mode") ?? "full_name").trim();
+      await apiFetch(`/tenants/${principal.tenant_id}/settings/identity`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      flash = "Configuración de identidad guardada.";
+    } else if (action === "sheets_activate") {
+      await apiFetch(`/tenants/${principal.tenant_id}/sheets-config/activate`, {
+        method: "POST",
+        request: Astro.request,
+      });
+      flash = "Configuración de Sheets activada.";
+    } else if (action === "sheets_delete") {
+      await apiFetch(`/tenants/${principal.tenant_id}/sheets-config`, {
+        method: "DELETE",
+        request: Astro.request,
+      });
+      flash = "Configuración de Sheets eliminada.";
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Fetch current settings ────────────────────────────────────────────
+try {
+  ops = await apiJson<OperationalSettings>(
+    `/tenants/${principal.tenant_id}/settings/operations`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+    if (err instanceof ApiError) {
+      error = `No se pudieron cargar los ajustes (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+
+// ── Fetch bot + business config ──────────────────────────────────────
+try {
+  cfg = await apiJson<BotConfigData>(
+    `/tenants/${principal.tenant_id}/settings/config`,
+    { request: Astro.request },
+  );
+} catch {
+  // Config is supplementary; non-fatal if unavailable.
+}
+
+// ── Fetch data / integration settings ──────────────────────────
+try {
+  dataSettings = await apiJson<DataSettings>(
+    `/tenants/${principal.tenant_id}/settings/data`,
+    { request: Astro.request },
+  );
+} catch {
+  dataSettingsError = "No se pudieron cargar los ajustes de datos e integraciones.";
+}
+
+// ── Fetch sheets config ──────────────────────────────────────────
+try {
+  sheetsConfig = await apiJson<SheetsConfig>(
+    `/tenants/${principal.tenant_id}/sheets-config`,
+    { request: Astro.request },
+  );
+  if (sheetsConfig) {
+    sheetsFormLabel = sheetsConfig.label;
+    sheetsFormApiKey = String(sheetsConfig.credentials?.["api_key"] ?? "");
+    sheetsFormSpreadsheetId = String(sheetsConfig.settings?.["spreadsheet_id"] ?? "");
+    sheetsFormSheetName = String(sheetsConfig.settings?.["sheet_name"] ?? "Sheet1");
+    sheetsFormRange = String(sheetsConfig.settings?.["range"] ?? "A1:Z");
+  }
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    // No config yet — form stays at defaults.
+  } else {
+    sheetsConfigError = "No se pudo cargar la configuración de Sheets.";
+  }
+}
+
+// ── Fetch identity settings ────────────────────────────────────
+try {
+  identitySettings = await apiJson<IdentitySettings>(
+    `/tenants/${principal.tenant_id}/settings/identity`,
+    { request: Astro.request },
+  );
+} catch {
+  identitySettingsError = "No se pudieron cargar los ajustes de identidad.";
+}
+
+// ── Fetch recent logs ─────────────────────────────────────────────
+try {
+  auditLogs = await apiJson<AuditLogList>(
+    `/tenants/${principal.tenant_id}/logs?limit=20`,
+    { request: Astro.request },
+  ).then(r => r.entries);
+} catch {
+  // Logs are supplementary; don't show an error.
+}
+---
+
+<TenantBase title="Configuración — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Operaciones</span>
+        <h1>Configuración</h1>
+        <p class="card-subtitle">
+          Controla cómo se comporta el bot de tu barbería y qué fechas están cerradas para reservas.
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href="/tenant/dashboard">Volver al panel</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="ops" />
+
+      <label class="checkbox">
+        <input type="checkbox" name="bot_enabled" checked={ops.bot_enabled} />
+        Bot habilitado
+      </label>
+      <p class="field-help">
+        Cuando está deshabilitado, el bot no procesará mensajes entrantes y responderá con un aviso de pausa.
+      </p>
+
+      <label>
+        Fechas cerradas (separadas por coma, formato YYYY-MM-DD)
+        <input
+          type="text"
+          name="closed_dates"
+          value={ops.closed_dates.join(", ")}
+          placeholder="ej. 2026-12-25, 2026-07-04"
+        />
+      </label>
+      <p class="field-help">
+        La recepción de reservas estará bloqueada para las fechas indicadas. Los clientes no podrán agendar turnos en esos días.
+      </p>
+
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Guardar configuración</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── Bot & Business config ─────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Configuración</span>
+        <h2>Bot y negocio</h2>
+        <p class="card-subtitle">
+          Personaliza el saludo, comportamiento y detalles de visualización del bot.
+        </p>
+      </div>
+    </div>
+
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="config" />
+
+      <label>
+        Nombre comercial
+        <input type="text" name="display_name" value={cfg.display_name} placeholder="ej. Barbería de Joe" />
+      </label>
+      <p class="field-help">
+        Se muestra en la conversación del bot y en las notificaciones de reserva.
+      </p>
+
+      <label>
+        Teléfono de contacto
+        <input type="text" name="contact_phone" value={cfg.contact_phone} placeholder="ej. +5491123456789" />
+      </label>
+      <p class="field-help">
+        Se muestra a los clientes para consultas o emergencias.
+      </p>
+
+      <label>
+        Dirección / Ubicación
+        <input type="text" name="location" value={cfg.location} placeholder="ej. Av. Corrientes 1234, CABA" />
+      </label>
+      <p class="field-help">
+        Se muestra a los clientes en la conversación y en notificaciones.
+      </p>
+
+      <label>
+        Horario laboral
+        <input type="text" name="hours" value={cfg.hours} placeholder="ej. Lun-Vie 9:00-19:00, Sáb 9:00-14:00" />
+      </label>
+      <p class="field-help">
+        Describe el horario general del negocio. Se inyecta en el contexto del bot.
+      </p>
+
+      <label>
+        Texto de saludo
+        <textarea name="greeting_text" rows="3" placeholder="Hola, soy el bot de la barbería...">{cfg.greeting_text}</textarea>
+      </label>
+      <p class="field-help">
+        El primer mensaje que reciben los nuevos clientes. Solo texto plano.
+      </p>
+
+      <label>
+        Notas de comportamiento del bot
+        <textarea name="behavior_notes" rows="2" placeholder="Instrucciones para el bot, ej. tono, horario laboral...">{cfg.behavior_notes}</textarea>
+      </label>
+      <p class="field-help">
+        Notas internas sobre cómo debe comportarse el bot. No se muestran a los clientes.
+      </p>
+
+      <label>
+        Notas de reserva
+        <textarea name="booking_notes" rows="2" placeholder="Notas mostradas a los clientes al reservar...">{cfg.booking_notes}</textarea>
+      </label>
+      <p class="field-help">
+        Información adicional que se muestra durante el flujo de reserva.
+      </p>
+
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Guardar configuración</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── Customer Identity Settings ────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Reservas</span>
+        <h2>Identidad del cliente</h2>
+        <p class="card-subtitle">
+          Configura cómo se captura la identidad del cliente durante la reserva.
+        </p>
+      </div>
+    </div>
+
+    {identitySettingsError && <p class="form-error">{identitySettingsError}</p>}
+
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="identity" />
+
+      <label>
+        Modo de captura de identidad
+        <select name="identity_mode">
+          <option value="full_name" selected={identitySettings.mode === "full_name"}>
+            Nombre completo (campo único)
+          </option>
+          <option value="first_name_last_name" selected={identitySettings.mode === "first_name_last_name"}>
+            Nombre + Apellido
+          </option>
+          <option value="dni" selected={identitySettings.mode === "dni"}>
+            Solo DNI / documento
+          </option>
+          <option value="full_name_dni" selected={identitySettings.mode === "full_name_dni"}>
+            Nombre completo + DNI
+          </option>
+          <option value="first_name_last_name_dni" selected={identitySettings.mode === "first_name_last_name_dni"}>
+            Nombre + Apellido + DNI
+          </option>
+        </select>
+      </label>
+      <p class="field-help">
+        Controla qué información del cliente se recopila y cómo se muestra
+        en los turnos. Los cambios solo afectan a nuevas reservas.
+      </p>
+
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Guardar</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── Data & Integrations ──────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Integración</span>
+        <h2>Datos e integraciones</h2>
+        <p class="card-subtitle">
+          Configura cómo se gestionan y sincronizan los datos de tu negocio.
+        </p>
+      </div>
+    </div>
+
+    {dataSettingsError && <p class="form-error">{dataSettingsError}</p>}
+
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="data" />
+
+      <label>
+        Fuente de datos
+        <select name="source_of_truth">
+          <option value="database" selected={dataSettings.source_of_truth === "database"}>
+            Base de datos (seguro por defecto)
+          </option>
+          <option value="google_sheets" selected={dataSettings.source_of_truth === "google_sheets"}>
+            Google Sheets
+          </option>
+          <option value="hybrid" selected={dataSettings.source_of_truth === "hybrid"}>
+            Híbrido
+          </option>
+        </select>
+      </label>
+      <p class="field-help">
+        <strong>Base de datos</strong> — todos los datos en la base de datos de la plataforma, lo más seguro y confiable.
+        <strong>Google Sheets</strong> — los datos se leen desde una hoja de cálculo conectada.
+        <strong>Híbrido</strong> — datos sincronizados entre la base de datos y Sheets.
+      </p>
+
+      <label>
+        Modo de sincronización
+        <select name="sync_mode">
+          <option value="manual" selected={dataSettings.sync_mode === "manual"}>Manual</option>
+          <option value="import_only" selected={dataSettings.sync_mode === "import_only"}>Solo importación</option>
+          <option value="import_export" selected={dataSettings.sync_mode === "import_export"}>Importación y exportación</option>
+        </select>
+      </label>
+      <p class="field-help">
+        <strong>Manual</strong> — sin sincronización automática. <strong>Solo importación</strong> — los datos fluyen hacia la BD.
+        <strong>Importación y exportación</strong> — sincronización bidireccional.
+      </p>
+
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Guardar</button>
+      </div>
+    </form>
+
+    <div class="card-section" style="margin-top:14px; padding-top:14px;">
+      <div class="card-section-head">
+        <h2>Importar desde hoja de cálculo</h2>
+      </div>
+      <p style="color:var(--muted); font-size:13px; margin:0 0 10px;">
+        Previsualiza e importa servicios desde datos copiados de una hoja de cálculo sin necesidad de conexión API real.
+      </p>
+      <a class="btn" href="/tenant/settings/import">
+        Importar servicios
+      </a>
+    </div>
+  </section>
+
+  <!-- ── Google Sheets Management ────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Integración</span>
+        <h2>Google Sheets</h2>
+        <p class="card-subtitle">
+          Conecta tu barbería a una hoja de cálculo de Google.
+          {sheetsConfig?.is_active
+            ? " Tu hoja está activa y lista para usar."
+            : " Configura y activa tu hoja a continuación."}
+        </p>
+      </div>
+      <div class="card-actions">
+        {sheetsConfig && (sheetsConfig.is_active
+          ? <span class="status status-active" style="height:22px;">conectado</span>
+          : <span class="status status-suspended" style="height:22px;">inactivo</span>
+        )}
+      </div>
+    </div>
+
+    {sheetsConfigError && <p class="form-error">{sheetsConfigError}</p>}
+
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="sheets" />
+
+      {sheetsConfig && (
+        <input type="hidden" name="sheets_id" value={sheetsConfig.id} />
+      )}
+
+      <fieldset>
+        <legend>Conexión</legend>
+        <div class="form-grid-2">
+          <label>
+            Etiqueta
+            <input type="text" name="sheets_label" value={sheetsFormLabel} required maxlength="120" placeholder="ej. Mi hoja de la barbería" />
+          </label>
+          <label>
+            Clave API de Google Sheets
+            <input type="password" name="sheets_api_key" value={sheetsFormApiKey} placeholder="Opcional para hojas públicas" autocomplete="off" spellcheck="false" />
+          </label>
+        </div>
+        <p class="field-help" style="margin-top:-4px;">
+          La clave API es opcional para hojas compartidas públicamente. Si se proporciona, mantenla en secreto.
+        </p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Hoja de cálculo</legend>
+        <div class="form-grid-2">
+          <label>
+            ID de la hoja
+            <input type="text" name="sheets_spreadsheet_id" value={sheetsFormSpreadsheetId} placeholder="ej. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms" />
+          </label>
+          <label>
+            Nombre de la hoja
+            <input type="text" name="sheets_sheet_name" value={sheetsFormSheetName} placeholder="Sheet1" />
+          </label>
+        </div>
+        <label>
+          Rango
+          <input type="text" name="sheets_range" value={sheetsFormRange} placeholder="ej. A1:Z1000" />
+        </label>
+        <p class="field-help">
+          El ID de la hoja es la cadena larga en la URL: <code>https://docs.google.com/spreadsheets/d/&lt;ID&gt;/edit</code>.
+          Deja la clave API vacía para hojas públicas.
+        </p>
+      </fieldset>
+
+      <div class="pcf-activation">
+        <label class="checkbox">
+          <input type="checkbox" name="sheets_is_active" checked={sheetsConfig?.is_active ?? true} />
+          Activo
+        </label>
+        <span class="field-help pcf-activate-hint">
+          Solo se permite una configuración activa de Sheets por cuenta. Activar desactiva cualquier anterior.
+        </span>
+      </div>
+
+      <div class="form-footer">
+        <div style="display:flex; gap:8px; align-items:center;">
+          {sheetsConfig && !sheetsConfig.is_active && (
+            <button type="submit" formaction={url} formmethod="post" name="_action" value="sheets_activate" class="btn primary small">
+              Activar
+            </button>
+          )}
+          {sheetsConfig && (
+            <button type="submit" formaction={url} formmethod="post" name="_action" value="sheets_delete" class="btn danger small"
+              onclick="return confirm('¿Eliminar esta configuración de Sheets? Esta acción no se puede deshacer.');">
+              Eliminar
+            </button>
+          )}
+        </div>
+        <button type="submit" class="btn primary">
+          {sheetsConfig ? "Guardar cambios" : "Conectar"}
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── Runtime Mode ─────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Ejecución</span>
+        <h2>Modo operativo</h2>
+        <p class="card-subtitle">
+          <strong>{dataSettings.source_of_truth}</strong>
+          {dataSettings.source_of_truth === "google_sheets" ? " — los datos se leen desde Google Sheets" : dataSettings.source_of_truth === "hybrid" ? " — el bot lee desde Sheets, las reservas desde la BD" : " — todos los datos en la base de datos de la plataforma"}
+        </p>
+      </div>
+      <div class="card-actions">
+        <span class={`status ${dataSettings.sheets_connected ? "status-active" : "status-suspended"}`}>
+          {dataSettings.sheets_connected ? "sheets conectado" : "sin sheets"}
+        </span>
+      </div>
+    </div>
+
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+      <a class="btn small" href="/workspace/today" target="_blank">
+        Espacio del barbero &nearr;
+      </a>
+    </div>
+
+    {dataSettings.source_of_truth !== "database" && (
+      <div style="margin-top:10px; padding:8px 10px; background:var(--warn-bg); border-radius:var(--radius-sm);">
+        <p style="margin:0; font-size:12px; color:var(--warn-fg);">
+          <strong>Modo solo lectura.</strong> Los datos operativos impulsados por Sheets son de solo lectura.
+          Usa el panel de administración para gestionar turnos, servicios y barberos.
+        </p>
+      </div>
+    )}
+  </section>
+
+  <!-- ── Recent logs ──────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Operaciones</span>
+        <h2>Actividad reciente</h2>
+        <p class="card-subtitle">Últimos eventos operativos de tu barbería.</p>
+      </div>
+    </div>
+    {auditLogs.length === 0 ? (
+      <div class="empty-state">
+        <p>Aún no hay entradas de registro.</p>
+      </div>
+    ) : (
+      <div class="ts-log-list">
+        {auditLogs.map((e) => (
+          <div class={`ts-log-row ts-log-${e.level}`}>
+            <div class="ts-log-meta">
+              <span class={`ts-log-level ts-log-level-${e.level}`}>{e.level}</span>
+              <span class="ts-log-type">{e.event_type}</span>
+              <span class="ts-log-date">{new Date(e.created_at).toLocaleString()}</span>
+            </div>
+            <div class="ts-log-msg">{e.message}</div>
+            {e.duration_ms != null && (
+              <div class="ts-log-duration">{e.duration_ms}ms</div>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+  </section>
+</TenantBase>

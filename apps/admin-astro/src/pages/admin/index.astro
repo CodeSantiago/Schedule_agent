@@ -1,0 +1,79 @@
+---
+import Base from "../../layouts/Base.astro";
+import { getPrincipal } from "../../lib/session";
+import { apiJson, ApiError } from "../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+  timezone: string;
+}
+
+let tenants: Tenant[] = [];
+let loadError: string | null = null;
+try {
+  tenants = await apiJson<Tenant[]>("/superadmin/tenants?limit=500", {
+    request: Astro.request,
+  });
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    loadError = `No se pudieron cargar los negocios (${err.status}).`;
+  } else {
+    loadError = "No se pudo contactar la API.";
+  }
+}
+---
+
+<Base title="Negocios — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Panel de control</span>
+        <h1>Negocios</h1>
+        <p class="card-subtitle">Todos los negocios conectados a Barber Agent.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small primary" href="/admin/tenants/new">Nuevo negocio</a>
+      </div>
+    </div>
+    {loadError && <p class="form-error">{loadError}</p>}
+    {tenants.length === 0 ? (
+      <div class="empty-state">
+        <p>Aún no hay negocios. Crea uno para comenzar.</p>
+        <a class="btn small primary" href="/admin/tenants/new">Nuevo negocio</a>
+      </div>
+    ) : (
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>Nombre</th>
+            <th>Slug</th>
+            <th>Estado</th>
+            <th>Zona horaria</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {tenants.map((t) => (
+            <tr>
+              <td><strong>{t.name}</strong></td>
+              <td><code>{t.slug}</code></td>
+              <td><span class={`status status-${t.status}`}>{t.status}</span></td>
+              <td>{t.timezone}</td>
+              <td class="actions">
+                <a class="btn small" href={`/admin/tenants/${t.id}/settings`}>Configuración</a>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </section>
+</Base>

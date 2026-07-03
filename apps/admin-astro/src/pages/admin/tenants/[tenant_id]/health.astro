@@ -1,0 +1,144 @@
+---
+import Base from "../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../lib/session";
+import { apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id } = Astro.params;
+if (!tenant_id) {
+  return new Response("Falta el identificador del negocio", { status: 400 });
+}
+
+interface HealthData {
+  tenant_id: string;
+  bot: { enabled: boolean; greeting_configured: boolean; behavior_notes_set: boolean; display_name_configured: boolean };
+  sheets: { connected: boolean; config_label: string | null; spreadsheet_configured: boolean };
+  data_policy: { source_of_truth: string; sync_mode: string };
+  counts: { active_barbers: number; total_barbers: number; active_services: number; total_services: number; upcoming_appointments: number };
+  recent_issues: Array<{ event_type: string; level: string; message: string; created_at: string }>;
+  providers: Array<{ kind: string; label: string; is_active: boolean; provider_name: string }>;
+  overall: string;
+}
+
+let health: HealthData | null = null;
+let loadError: string | null = null;
+
+try {
+  health = await apiJson<HealthData>(
+    `/superadmin/tenants/${tenant_id}/health`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    loadError = `No se pudo cargar el estado operativo (${err.status}).`;
+  } else {
+    loadError = "No se pudo contactar la API.";
+  }
+}
+
+function overallBadge(overall: string): string {
+  const map: Record<string, string> = { healthy: "status-active", attention: "status-suspended", critical: "status-churned" };
+  return map[overall] ?? "status-trial";
+}
+---
+
+<Base title="Centro de salud — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Operaciones</span>
+        <h1>Centro de salud</h1>
+        <p class="card-subtitle">Estado operativo de este negocio.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href={`/admin/tenants/${tenant_id}/settings`}>Volver a configuración</a>
+      </div>
+    </div>
+
+    {loadError && <p class="form-error">{loadError}</p>}
+
+    {health && (
+      <>
+        <div class="cards">
+          <div class="kpi">
+            <div class="kpi-label">Estado general</div>
+            <div style="margin-top:4px;">
+              <span class={`status ${overallBadge(health.overall)}`}>{health.overall}</span>
+            </div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Bot</div>
+            <div class="kpi-value" style="font-size:16px;">
+              {health.bot.enabled
+                ? <span class="status status-active">Activo</span>
+                : <span class="status status-churned">Apagado</span>}
+            </div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Sheets</div>
+            <div class="kpi-value" style="font-size:16px;">
+              {health.sheets.connected
+                ? <span class="status status-active">Conectado</span>
+                : <span class="status status-suspended">No conectado</span>}
+            </div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Barberos</div>
+            <div class="kpi-value">{health.counts.active_barbers}/{health.counts.total_barbers}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Servicios</div>
+            <div class="kpi-value">{health.counts.active_services}/{health.counts.total_services}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Próximos</div>
+            <div class="kpi-value">{health.counts.upcoming_appointments}</div>
+          </div>
+        </div>
+
+        {health.providers.length > 0 && (
+          <div class="card-section">
+            <div class="card-section-head">
+              <h2>Conexiones de proveedores</h2>
+            </div>
+            <table class="grid">
+              <thead><tr><th>Tipo</th><th>Etiqueta</th><th>Proveedor</th><th>Estado</th></tr></thead>
+              <tbody>
+                {health.providers.map(p => (
+                  <tr>
+                    <td><code>{p.kind}</code></td>
+                    <td>{p.label}</td>
+                    <td><code>{p.provider_name}</code></td>
+                    <td>{p.is_active ? <span class="status status-active">Activo</span> : <span class="status status-suspended">Inactivo</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {health.recent_issues.length > 0 && (
+          <div class="card-section">
+            <div class="card-section-head"><h2>Incidencias recientes</h2></div>
+            <div class="ts-log-list">
+              {health.recent_issues.map(e => (
+                <div class={`ts-log-row ts-log-${e.level}`}>
+                  <div class="ts-log-meta">
+                    <span class={`ts-log-level ts-log-level-${e.level}`}>{e.level}</span>
+                    <span class="ts-log-type">{e.event_type}</span>
+                    <span class="ts-log-date">{new Date(e.created_at).toLocaleString()}</span>
+                  </div>
+                  <div class="ts-log-msg">{e.message}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </>
+    )}
+  </section>
+</Base>

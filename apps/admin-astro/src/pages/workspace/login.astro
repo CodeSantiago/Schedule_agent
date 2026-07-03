@@ -1,0 +1,61 @@
+---
+import WorkspaceBase from "../../layouts/WorkspaceBase.astro";
+import { tenantLogin, setTenantSessionCookie } from "../../lib/session";
+
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const email = String(form.get("email") ?? "").trim();
+  const password = String(form.get("password") ?? "");
+
+  if (!email || !password) {
+    error = "El correo y la contraseña son obligatorios.";
+  } else {
+    const result = await tenantLogin(email, password);
+    if (result.ok && result.token && result.tenant_id) {
+      setTenantSessionCookie(Astro.cookies, result.token, result.email ?? "", result.tenant_id);
+      return Astro.redirect("/workspace/today");
+    } else {
+      error = result.error ?? "Error al iniciar sesión.";
+    }
+  }
+}
+---
+
+<WorkspaceBase title="Acceso de barbero — Barber Agent">
+  <section class="card narrow" style="margin-top:40px;">
+    <div class="card-header" style="flex-direction:column; text-align:center;">
+      <span class="card-eyebrow">Espacio del barbero</span>
+      <h1>Iniciar sesión</h1>
+      <p class="card-subtitle">
+        Ingresa tus credenciales del espacio de trabajo para ver la agenda de hoy.
+      </p>
+    </div>
+
+    {error && <p class="form-error">{error}</p>}
+
+    <form method="post" class="form" style="margin-top:10px;">
+      <label>
+        Correo electrónico
+        <input type="email" name="email" required placeholder="tu@barberia.com" autocomplete="email" />
+      </label>
+      <label>
+        Contraseña
+        <input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="current-password" />
+      </label>
+
+      <p class="field-help" style="margin-top:-4px;">
+        Usa tus credenciales del espacio de trabajo. Si no tienes una, consulta con el administrador de la barbería.
+      </p>
+
+      <div class="form-footer" style="border:none; padding-top:4px;">
+        <button type="submit" class="btn primary" style="width:100%;">Iniciar sesión</button>
+      </div>
+    </form>
+
+    <p class="field-help" style="margin-top:14px; text-align:center;">
+      <a href="/tenant/login">Acceso de administrador &rarr;</a>
+    </p>
+  </section>
+</WorkspaceBase>

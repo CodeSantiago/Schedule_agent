@@ -1,0 +1,51 @@
+---
+import Base from "../layouts/Base.astro";
+import { getPrincipal, login, setSessionCookie } from "../lib/session";
+
+let error: string | null = null;
+let email = "";
+
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const submittedEmail = String(form.get("email") ?? "").trim();
+  const password = String(form.get("password") ?? "");
+  email = submittedEmail;
+
+  if (!submittedEmail || !password) {
+    error = "El correo y la contraseña son obligatorios.";
+  } else {
+    const result = await login(submittedEmail, password);
+    if (result.ok && result.token && result.email) {
+      setSessionCookie(Astro.cookies, result.token, result.email);
+      return Astro.redirect("/admin");
+    }
+    error = result.error ?? "No se pudo iniciar sesión.";
+  }
+}
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal !== null) {
+  return Astro.redirect("/admin");
+}
+---
+
+<Base title="Iniciar sesión — Barber Agent" email={null}>
+  <section class="card narrow">
+    <span class="card-eyebrow">Cuenta</span>
+    <h1>Iniciar sesión</h1>
+    <p class="card-subtitle">Bienvenido de nuevo. Usa tus credenciales de administrador para continuar.</p>
+    {error && <p class="form-error">{error}</p>}
+    <form method="post" action="/login" class="form">
+      <label>Correo electrónico
+        <input type="email" name="email" value={email} required autofocus />
+      </label>
+      <label>Contraseña
+        <input type="password" name="password" required />
+      </label>
+      <div class="form-footer">
+        <a class="btn small ghost" href="/">Cancelar</a>
+        <button type="submit" class="btn primary">Iniciar sesión</button>
+      </div>
+    </form>
+  </section>
+</Base>

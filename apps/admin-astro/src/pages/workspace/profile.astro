@@ -1,0 +1,116 @@
+---
+import WorkspaceBase from "../../layouts/WorkspaceBase.astro";
+import { getTenantPrincipal } from "../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/workspace/login");
+}
+
+interface MeData {
+  principal_id: string;
+  email: string;
+  scope: string;
+  tenant_id?: string;
+  role?: string;
+  barber_id?: string;
+  barber_name?: string;
+  name?: string;
+  photo_url?: string;
+}
+
+let flash: string | null = null;
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const name = String(form.get("name") ?? "").trim();
+  const photoUrl = String(form.get("photo_url") ?? "").trim();
+
+  try {
+    await apiFetch("/tenants/auth/me", {
+      method: "PATCH",
+      request: Astro.request,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, photo_url: photoUrl }),
+    });
+    flash = "Perfil actualizado.";
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `No se pudo actualizar (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+let me: MeData | null = null;
+try {
+  me = await apiJson<MeData>("/tenants/auth/me", { request: Astro.request });
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = error ?? `No se pudo cargar el perfil (${err.status}).`;
+  } else {
+    error = error ?? "No se pudo contactar la API.";
+  }
+}
+---
+
+<WorkspaceBase
+  title="Mi perfil — Workspace"
+  email={principal.email}
+  barberName={me?.barber_name ?? principal.barber_name ?? null}
+  photoUrl={me?.photo_url ?? principal.photo_url ?? null}
+>
+  <section class="ws-card">
+    <div class="ws-header">
+      <div>
+        <span class="ws-eyebrow">Perfil</span>
+        <h1>Mi perfil</h1>
+        <p class="ws-subtitle">Actualiza tu nombre y una foto simple para el espacio de trabajo.</p>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <div class="ws-profile-grid" style="margin-bottom:14px;">
+      <div class="ws-profile-field">
+        <span class="ws-profile-label">Correo</span>
+        <span class="ws-profile-value">{me?.email ?? principal.email}</span>
+      </div>
+      <div class="ws-profile-field">
+        <span class="ws-profile-label">Rol</span>
+        <span class="ws-profile-value">{me?.role ?? principal.scope}</span>
+      </div>
+      <div class="ws-profile-field">
+        <span class="ws-profile-label">Barbero vinculado</span>
+        <span class="ws-profile-value">{me?.barber_name ?? "—"}</span>
+      </div>
+    </div>
+
+    <form method="post" class="form">
+      <label>
+        Nombre visible
+        <input type="text" name="name" required value={me?.name ?? ""} placeholder="Tu nombre" />
+      </label>
+      <label>
+        Foto (URL)
+        <input type="url" name="photo_url" value={me?.photo_url ?? ""} placeholder="https://..." />
+      </label>
+      <p class="field-help">Opcional. Por ahora alcanza con una URL pública de imagen.</p>
+      <div class="form-footer" style="border:none; padding-top:4px;">
+        <button type="submit" class="btn primary" style="width:100%;">Guardar cambios</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="ws-card ws-footer-card">
+    <div class="ws-footer-links">
+      <a href="/workspace/today" class="btn small ghost">Volver a mi agenda</a>
+      <a href="/workspace/logout" class="btn small ghost">Cerrar sesión</a>
+    </div>
+  </section>
+</WorkspaceBase>

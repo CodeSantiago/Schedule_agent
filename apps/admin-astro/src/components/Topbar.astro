@@ -1,0 +1,53 @@
+---
+interface Props {
+  email?: string | null;
+  /** "admin" (platform console), "tenant" (business workspace), or "workspace" (barber mobile). */
+  context: "admin" | "tenant" | "workspace";
+}
+const { email = null, context } = Astro.props;
+
+let contextLabel: string;
+let contextTitle: string;
+let logoutPath: string;
+let signInPath: string;
+let homePath: string;
+
+if (context === "workspace") {
+  contextTitle = "Agenda de hoy";
+  logoutPath = "/workspace/logout";
+  signInPath = "/workspace/login";
+  homePath = "/workspace/today";
+} else if (context === "tenant") {
+  contextTitle = "Panel del negocio";
+  logoutPath = "/tenant/logout";
+  signInPath = "/tenant/login";
+  homePath = "/tenant/dashboard";
+} else {
+  contextTitle = "Control general";
+  logoutPath = "/logout";
+  signInPath = "/login";
+  homePath = "/admin";
+}
+---
+
+<header class="topbar" data-context={context === "workspace" ? "tenant" : context}>
+  <div class="topbar-inner">
+    <a class="brand" href={homePath}>
+      <span class="brand-copy">
+        <span class="brand-title">{contextTitle}</span>
+      </span>
+    </a>
+    <nav class="topnav">
+      {email ? (
+        <>
+          <span class="user">{email}</span>
+          <form method="post" action={logoutPath} class="inline">
+            <button type="submit" class="btn topbar-logout">Salir</button>
+          </form>
+        </>
+      ) : (
+        <a href={signInPath} class="btn topbar-login">Entrar</a>
+      )}
+    </nav>
+  </div>
+</header>

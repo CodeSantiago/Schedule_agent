@@ -1,0 +1,959 @@
+---
+import TenantBase from "../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+// ── Mode ─────────────────────────────────────────────────────────────────
+
+const mode = Astro.url.searchParams.get("mode") ?? "services";
+const isServices = mode === "services";
+const isBarbers = mode === "barbers";
+const isSchedules = mode === "schedules";
+
+// ── Types (services) ─────────────────────────────────────────────────────
+
+interface ServiceImportRow {
+  code: string;
+  name: string;
+  duration_minutes: number;
+  price_cents: number;
+  description: string | null;
+}
+
+interface ServiceImportRowPreview {
+  classification: string;
+  reason: string;
+  row_index: number;
+  row: ServiceImportRow;
+}
+
+interface ServiceImportPreviewResponse {
+  total: number;
+  create: ServiceImportRowPreview[];
+  update: ServiceImportRowPreview[];
+  unchanged: ServiceImportRowPreview[];
+  invalid: ServiceImportRowPreview[];
+}
+
+interface ServiceImportApplyResult {
+  created: number;
+  updated: number;
+  errors: string[];
+}
+
+// ── Types (barbers) ──────────────────────────────────────────────────────
+
+interface BarberImportRow {
+  name: string;
+  restrictions: string | null;
+  is_active: boolean;
+}
+
+interface BarberImportRowPreview {
+  classification: string;
+  reason: string;
+  row_index: number;
+  row: BarberImportRow;
+}
+
+interface BarberImportPreviewResponse {
+  total: number;
+  create: BarberImportRowPreview[];
+  update: BarberImportRowPreview[];
+  unchanged: BarberImportRowPreview[];
+  invalid: BarberImportRowPreview[];
+}
+
+interface BarberImportApplyResult {
+  created: number;
+  updated: number;
+  errors: string[];
+}
+
+// ── Types (schedules) ───────────────────────────────────────────────────
+
+interface ScheduleImportRow {
+  barber_name: string;
+  weekday: string;
+  start_time: string;
+  end_time: string;
+}
+
+interface ScheduleImportRowPreview {
+  classification: string;
+  reason: string;
+  row_index: number;
+  row: ScheduleImportRow;
+}
+
+interface ScheduleImportPreviewResponse {
+  total: number;
+  create: ScheduleImportRowPreview[];
+  update: ScheduleImportRowPreview[];
+  unchanged: ScheduleImportRowPreview[];
+  invalid: ScheduleImportRowPreview[];
+}
+
+interface ScheduleImportApplyResult {
+  created: number;
+  updated: number;
+  errors: string[];
+}
+
+// ── State ────────────────────────────────────────────────────────────────
+
+let error: string | null = null;
+let flash: string | null = null;
+let svcPreviewResult: ServiceImportPreviewResponse | null = null;
+let svcApplyResult: ServiceImportApplyResult | null = null;
+let brbPreviewResult: BarberImportPreviewResponse | null = null;
+let brbApplyResult: BarberImportApplyResult | null = null;
+let schPreviewResult: ScheduleImportPreviewResponse | null = null;
+let schApplyResult: ScheduleImportApplyResult | null = null;
+
+const currentUrl = Astro.url.pathname;
+
+// ── Handle POST ──────────────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+  const importMode = String(form.get("_mode") ?? "services");
+
+  try {
+    if (action === "preview") {
+      const content = String(form.get("import_content") ?? "");
+      const delimiter = String(form.get("delimiter") ?? "\t");
+
+      if (!content.trim()) {
+        error = "Por favor, pega el contenido de tu hoja de cálculo.";
+      } else if (importMode === "barbers") {
+        brbPreviewResult = await apiJson<BarberImportPreviewResponse>(
+          `/tenants/${principal.tenant_id}/import/barbers/preview`,
+          {
+            method: "POST",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ content, delimiter }),
+          },
+        );
+      } else {
+        svcPreviewResult = await apiJson<ServiceImportPreviewResponse>(
+          `/tenants/${principal.tenant_id}/import/services/preview`,
+          {
+            method: "POST",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ content, delimiter }),
+          },
+        );
+      }
+    } else if (action === "apply") {
+      const createRaw = String(form.get("import_create") ?? "[]");
+      const updateRaw = String(form.get("import_update") ?? "[]");
+      const create = JSON.parse(createRaw);
+      const update = JSON.parse(updateRaw);
+
+      if (importMode === "schedules") {
+        schApplyResult = await apiJson<ScheduleImportApplyResult>(
+          `/tenants/${principal.tenant_id}/import/schedules/apply`,
+          {
+            method: "POST",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ create, update }),
+          },
+        );
+        if (schApplyResult.errors.length === 0) {
+          flash = `Importación de horarios aplicada: ${schApplyResult.created} creados, ${schApplyResult.updated} actualizados.`;
+        }
+        schPreviewResult = null;
+      } else if (importMode === "barbers") {
+        brbApplyResult = await apiJson<BarberImportApplyResult>(
+          `/tenants/${principal.tenant_id}/import/barbers/apply`,
+          {
+            method: "POST",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ create, update }),
+          },
+        );
+        if (brbApplyResult.errors.length === 0) {
+          flash = `Importación de barberos aplicada: ${brbApplyResult.created} creados, ${brbApplyResult.updated} actualizados.`;
+        }
+        brbPreviewResult = null;
+      } else {
+        svcApplyResult = await apiJson<ServiceImportApplyResult>(
+          `/tenants/${principal.tenant_id}/import/services/apply`,
+          {
+            method: "POST",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ create, update }),
+          },
+        );
+        if (svcApplyResult.errors.length === 0) {
+          flash = `Importación de servicios aplicada: ${svcApplyResult.created} creados, ${svcApplyResult.updated} actualizados.`;
+        }
+        svcPreviewResult = null;
+      }
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+function formatPrice(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+---
+
+<TenantBase title="Importar datos — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Importar</span>
+        <h1>Importar desde hoja de cálculo</h1>
+        <p class="card-subtitle">
+          Previsualiza antes de aplicar. Solo las filas <strong>crear</strong> y <strong>actualizar</strong> serán aplicadas;
+          las filas sin cambios e inválidas se omiten.
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/settings">Volver a configuración</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <!-- ── Tab bar ──────────────────────────────────────────────────── -->
+    <div class="tab-bar">
+      <a
+        class="tab {isServices ? 'tab-active' : ''}"
+        href="{currentUrl}?mode=services"
+      >Servicios</a>
+      <a
+        class="tab {isBarbers ? 'tab-active' : ''}"
+        href="{currentUrl}?mode=barbers"
+      >Barberos</a>
+      <a
+        class="tab {isSchedules ? 'tab-active' : ''}"
+        href="{currentUrl}?mode=schedules"
+      >Horarios</a>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <!-- SERVICES IMPORT                                                 -->
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    {isServices && (
+      <>
+        {!svcPreviewResult && !svcApplyResult && (
+          <form method="post" action={currentUrl} class="form">
+            <input type="hidden" name="_action" value="preview" />
+            <input type="hidden" name="_mode" value="services" />
+
+            <label>
+              Pega aquí el contenido de tu hoja de cálculo
+              <textarea
+                name="import_content"
+                rows="10"
+                placeholder={"code\tname\tduration_minutes\tprice_cents\tdescription\nC\tCorte\t30\t2500\tCorte estándar\nB\tBarba\t15\t1500\tArreglo de barba\nCB\tCorte y Barba\t60\t3500\tCorte + barba"}
+                style="font-family:var(--mono); font-size:12px; white-space:pre;"
+              ></textarea>
+            </label>
+            <p class="field-help">
+              Formato TSV (separado por tabulaciones). Fila de encabezado con <code>code</code>, <code>name</code>,
+              <code>duration_minutes</code>, <code>price_cents</code> (opcional), <code>description</code> (opcional).
+              Los servicios se emparejan por <strong>code</strong> — los servicios existentes con el mismo código se actualizan.
+            </p>
+
+            <label>
+              Delimitador
+              <select name="delimiter">
+                <option value="&#x9;">Tabulación (TSV)</option>
+                <option value=",">Coma (CSV)</option>
+                <option value=";">Punto y coma</option>
+              </select>
+            </label>
+
+            <div class="form-footer">
+              <div class="card-actions">
+                <a class="btn small ghost" href="/tenant/settings">Cancelar</a>
+                <button type="submit" class="btn primary">Previsualizar importación</button>
+              </div>
+            </div>
+          </form>
+        )}
+
+        {svcPreviewResult && (
+          <>
+            <div class="import-summary">
+              <span class="import-summary-item">Total filas: <strong>{svcPreviewResult.total}</strong></span>
+              <span class="import-summary-item create">A crear: <strong>{svcPreviewResult.create.length}</strong></span>
+              <span class="import-summary-item update">A actualizar: <strong>{svcPreviewResult.update.length}</strong></span>
+              <span class="import-summary-item unchanged">Sin cambios: <strong>{svcPreviewResult.unchanged.length}</strong></span>
+              <span class="import-summary-item invalid">Inválidas: <strong>{svcPreviewResult.invalid.length}</strong></span>
+            </div>
+
+            {svcPreviewResult.create.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Crear <span class="h2-sub">({svcPreviewResult.create.length} servicios)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Código</th>
+                      <th>Nombre</th>
+                      <th>Duración</th>
+                      <th>Precio</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {svcPreviewResult.create.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td><code>{entry.row.code}</code></td>
+                        <td>{entry.row.name}</td>
+                        <td>{entry.row.duration_minutes} min</td>
+                        <td>{formatPrice(entry.row.price_cents)}</td>
+                        <td><span class="status status-active" style="font-size:10px;">nuevo</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {svcPreviewResult.update.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Actualizar <span class="h2-sub">({svcPreviewResult.update.length} servicios)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Código</th>
+                      <th>Nombre</th>
+                      <th>Duración</th>
+                      <th>Precio</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {svcPreviewResult.update.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td><code>{entry.row.code}</code></td>
+                        <td>{entry.row.name}</td>
+                        <td>{entry.row.duration_minutes} min</td>
+                        <td>{formatPrice(entry.row.price_cents)}</td>
+                        <td><span class="status status-pending" style="font-size:10px;">cambios</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {svcPreviewResult.unchanged.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Sin cambios <span class="h2-sub">({svcPreviewResult.unchanged.length} filas — omitidas)</span></h2>
+                </div>
+              </section>
+            )}
+
+            {svcPreviewResult.invalid.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Inválidas <span class="h2-sub">({svcPreviewResult.invalid.length} filas — se omitirán)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Code</th>
+                      <th>Name</th>
+                      <th>Errors</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {svcPreviewResult.invalid.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td><code>{entry.row.code}</code></td>
+                        <td>{entry.row.name}</td>
+                        <td><span class="import-error-text">{entry.reason}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            <div class="form-footer" style="margin-top:20px;">
+              <div class="card-actions">
+                <form method="post" action={currentUrl} style="display:inline;">
+                  <input type="hidden" name="_action" value="preview" />
+                  <input type="hidden" name="_mode" value="services" />
+                  <button type="submit" class="btn ghost">Volver a previsualizar</button>
+                </form>
+
+                {(svcPreviewResult.create.length > 0 || svcPreviewResult.update.length > 0) && (
+                  <form method="post" action={currentUrl} style="display:inline;">
+                    <input type="hidden" name="_action" value="apply" />
+                    <input type="hidden" name="_mode" value="services" />
+                    <input type="hidden" name="import_create" value={JSON.stringify(svcPreviewResult.create.map(e => e.row))} />
+                    <input type="hidden" name="import_update" value={JSON.stringify(svcPreviewResult.update.map(e => e.row))} />
+                    <button
+                      type="submit"
+                      class="btn primary"
+                      onclick="return confirm('¿Aplicar {svcPreviewResult.create.length} creaciones y {svcPreviewResult.update.length} actualizaciones? Esto modifica tu catálogo de servicios.');"
+                    >
+                      Aplicar importación ({svcPreviewResult.create.length} crear, {svcPreviewResult.update.length} actualizar)
+                    </button>
+                  </form>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {svcApplyResult && (
+          <div class="import-result">
+            <div class="import-result-icon">&#10003;</div>
+            <div>
+              <h2>Importación completa</h2>
+              <p>
+                <strong>{svcApplyResult.created}</strong> servicio(s) creado(s),
+                <strong>{svcApplyResult.updated}</strong> servicio(s) actualizado(s).
+              </p>
+              {svcApplyResult.errors.length > 0 && (
+                <div class="import-result-errors">
+                  <h3>Errores ({svcApplyResult.errors.length})</h3>
+                  <ul>
+                    {svcApplyResult.errors.map((e) => <li>{e}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div style="margin-top:12px;">
+                <a class="btn" href="/tenant/services">Ver servicios</a>
+                <a class="btn ghost" href="{currentUrl}?mode=services" style="margin-left:8px;">Importar más</a>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    )}
+
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <!-- BARBERS IMPORT                                                  -->
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    {isBarbers && (
+      <>
+        {!brbPreviewResult && !brbApplyResult && (
+          <form method="post" action={currentUrl} class="form">
+            <input type="hidden" name="_action" value="preview" />
+            <input type="hidden" name="_mode" value="barbers" />
+
+            <label>
+              Pega aquí el contenido de tu hoja de cálculo
+              <textarea
+                name="import_content"
+                rows="10"
+                placeholder={"name\trestrictions\tis_active\nAna\t\tTrue\nBob\tSOLO_CORTE\tTrue\nCarlos\t\tfalse"}
+                style="font-family:var(--mono); font-size:12px; white-space:pre;"
+              ></textarea>
+            </label>
+            <p class="field-help">
+              Formato TSV (separado por tabulaciones). Fila de encabezado con <code>name</code>,
+              <code>restrictions</code> (opcional), <code>is_active</code> (opcional, true/false).
+              Los barberos se emparejan por <strong>name</strong> — los barberos existentes con el mismo nombre se actualizan.
+            </p>
+
+            <label>
+              Delimitador
+              <select name="delimiter">
+                <option value="&#x9;">Tabulación (TSV)</option>
+                <option value=",">Coma (CSV)</option>
+                <option value=";">Punto y coma</option>
+              </select>
+            </label>
+
+            <div class="form-footer">
+              <div class="card-actions">
+                <a class="btn small ghost" href="/tenant/settings">Cancelar</a>
+                <button type="submit" class="btn primary">Previsualizar importación</button>
+              </div>
+            </div>
+          </form>
+        )}
+
+        {brbPreviewResult && (
+          <>
+            <div class="import-summary">
+              <span class="import-summary-item">Total filas: <strong>{brbPreviewResult.total}</strong></span>
+              <span class="import-summary-item create">A crear: <strong>{brbPreviewResult.create.length}</strong></span>
+              <span class="import-summary-item update">A actualizar: <strong>{brbPreviewResult.update.length}</strong></span>
+              <span class="import-summary-item unchanged">Sin cambios: <strong>{brbPreviewResult.unchanged.length}</strong></span>
+              <span class="import-summary-item invalid">Inválidas: <strong>{brbPreviewResult.invalid.length}</strong></span>
+            </div>
+
+            {brbPreviewResult.create.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Crear <span class="h2-sub">({brbPreviewResult.create.length} barberos)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Nombre</th>
+                      <th>Restricciones</th>
+                      <th>Activo</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brbPreviewResult.create.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.name}</td>
+                        <td class="muted">{entry.row.restrictions ?? "—"}</td>
+                        <td>{entry.row.is_active ? "Sí" : "No"}</td>
+                        <td><span class="status status-active" style="font-size:10px;">nuevo</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {brbPreviewResult.update.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Actualizar <span class="h2-sub">({brbPreviewResult.update.length} barberos)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Nombre</th>
+                      <th>Restricciones</th>
+                      <th>Activo</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brbPreviewResult.update.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.name}</td>
+                        <td class="muted">{entry.row.restrictions ?? "—"}</td>
+                        <td>{entry.row.is_active ? "Sí" : "No"}</td>
+                        <td><span class="status status-pending" style="font-size:10px;">cambios</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {brbPreviewResult.unchanged.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Sin cambios <span class="h2-sub">({brbPreviewResult.unchanged.length} filas — omitidas)</span></h2>
+                </div>
+              </section>
+            )}
+
+            {brbPreviewResult.invalid.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Inválidas <span class="h2-sub">({brbPreviewResult.invalid.length} filas — se omitirán)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Nombre</th>
+                      <th>Errores</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brbPreviewResult.invalid.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.name}</td>
+                        <td><span class="import-error-text">{entry.reason}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            <div class="form-footer" style="margin-top:20px;">
+              <div class="card-actions">
+                <form method="post" action={currentUrl} style="display:inline;">
+                  <input type="hidden" name="_action" value="preview" />
+                  <input type="hidden" name="_mode" value="barbers" />
+                  <button type="submit" class="btn ghost">Volver a previsualizar</button>
+                </form>
+
+                {(brbPreviewResult.create.length > 0 || brbPreviewResult.update.length > 0) && (
+                  <form method="post" action={currentUrl} style="display:inline;">
+                    <input type="hidden" name="_action" value="apply" />
+                    <input type="hidden" name="_mode" value="barbers" />
+                    <input type="hidden" name="import_create" value={JSON.stringify(brbPreviewResult.create.map(e => e.row))} />
+                    <input type="hidden" name="import_update" value={JSON.stringify(brbPreviewResult.update.map(e => e.row))} />
+                    <button
+                      type="submit"
+                      class="btn primary"
+                      onclick="return confirm('¿Aplicar {brbPreviewResult.create.length} creaciones y {brbPreviewResult.update.length} actualizaciones? Esto modifica tu lista de barberos.');"
+                    >
+                      Aplicar importación ({brbPreviewResult.create.length} crear, {brbPreviewResult.update.length} actualizar)
+                    </button>
+                  </form>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {brbApplyResult && (
+          <div class="import-result">
+            <div class="import-result-icon">&#10003;</div>
+            <div>
+              <h2>Importación completa</h2>
+              <p>
+                <strong>{brbApplyResult.created}</strong> barbero(s) creado(s),
+                <strong>{brbApplyResult.updated}</strong> barbero(s) actualizado(s).
+              </p>
+              {brbApplyResult.errors.length > 0 && (
+                <div class="import-result-errors">
+                  <h3>Errores ({brbApplyResult.errors.length})</h3>
+                  <ul>
+                    {brbApplyResult.errors.map((e) => <li>{e}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div style="margin-top:12px;">
+                <a class="btn" href="/tenant/settings">Volver a configuración</a>
+                <a class="btn ghost" href="{currentUrl}?mode=barbers" style="margin-left:8px;">Importar más</a>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    )}
+
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <!-- SCHEDULES IMPORT                                                -->
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    {isSchedules && (
+      <>
+        {!schPreviewResult && !schApplyResult && (
+          <form method="post" action={currentUrl} class="form">
+            <input type="hidden" name="_action" value="preview" />
+            <input type="hidden" name="_mode" value="schedules" />
+
+            <label>
+              Pega aquí el contenido de tu hoja de cálculo
+              <textarea
+                name="import_content"
+                rows="10"
+                placeholder={"barber_name\tweekday\tstart_time\tend_time\nAna\tmon\t10:00\t14:00\tTurno mañana\nBob\ttue\t10:30\t19:30\tJornada completa\nAna\twed\t09:00\t12:00\tTurno corto"}
+                style="font-family:var(--mono); font-size:12px; white-space:pre;"
+              ></textarea>
+            </label>
+            <p class="field-help">
+              Formato TSV (separado por tabulaciones). Fila de encabezado con <code>barber_name</code>,
+              <code>weekday</code> (<code>mon</code>–<code>sun</code>),
+              <code>start_time</code>, <code>end_time</code> (HH:MM en cuadrícula de 30 min).
+              Los barberos deben existir previamente. Los horarios se emparejan por
+              <strong>barber_name + weekday + start_time</strong> —
+              solo se actualiza <code>end_time</code> cuando se encuentra una coincidencia.
+            </p>
+
+            <label>
+              Delimitador
+              <select name="delimiter">
+                <option value="&#x9;">Tabulación (TSV)</option>
+                <option value=",">Coma (CSV)</option>
+                <option value=";">Punto y coma</option>
+              </select>
+            </label>
+
+            <div class="form-footer">
+              <div class="card-actions">
+                <a class="btn small ghost" href="/tenant/settings">Cancelar</a>
+                <button type="submit" class="btn primary">Previsualizar importación</button>
+              </div>
+            </div>
+          </form>
+        )}
+
+        {schPreviewResult && (
+          <>
+            <div class="import-summary">
+              <span class="import-summary-item">Total filas: <strong>{schPreviewResult.total}</strong></span>
+              <span class="import-summary-item create">A crear: <strong>{schPreviewResult.create.length}</strong></span>
+              <span class="import-summary-item update">A actualizar: <strong>{schPreviewResult.update.length}</strong></span>
+              <span class="import-summary-item unchanged">Sin cambios: <strong>{schPreviewResult.unchanged.length}</strong></span>
+              <span class="import-summary-item invalid">Inválidas: <strong>{schPreviewResult.invalid.length}</strong></span>
+            </div>
+
+            {schPreviewResult.create.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Crear <span class="h2-sub">({schPreviewResult.create.length} horarios)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Barbero</th>
+                      <th>Día</th>
+                      <th>Inicio</th>
+                      <th>Fin</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schPreviewResult.create.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.barber_name}</td>
+                        <td><code>{entry.row.weekday}</code></td>
+                        <td>{entry.row.start_time}</td>
+                        <td>{entry.row.end_time}</td>
+                        <td><span class="status status-active" style="font-size:10px;">new</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {schPreviewResult.update.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Actualizar <span class="h2-sub">({schPreviewResult.update.length} horarios)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Barbero</th>
+                      <th>Día</th>
+                      <th>Inicio</th>
+                      <th>Fin</th>
+                      <th>Razón</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schPreviewResult.update.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.barber_name}</td>
+                        <td><code>{entry.row.weekday}</code></td>
+                        <td>{entry.row.start_time}</td>
+                        <td>{entry.row.end_time}</td>
+                        <td><span class="status status-pending" style="font-size:10px;">cambios</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            {schPreviewResult.unchanged.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Sin cambios <span class="h2-sub">({schPreviewResult.unchanged.length} filas — omitidas)</span></h2>
+                </div>
+              </section>
+            )}
+
+            {schPreviewResult.invalid.length > 0 && (
+              <section class="card-section">
+                <div class="card-section-head">
+                  <h2>Inválidas <span class="h2-sub">({schPreviewResult.invalid.length} filas — se omitirán)</span></h2>
+                </div>
+                <table class="grid">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Barbero</th>
+                      <th>Día</th>
+                      <th>Errores</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schPreviewResult.invalid.map((entry) => (
+                      <tr>
+                        <td class="muted-2">{entry.row_index + 1}</td>
+                        <td>{entry.row.barber_name}</td>
+                        <td><code>{entry.row.weekday}</code></td>
+                        <td><span class="import-error-text">{entry.reason}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
+
+            <div class="form-footer" style="margin-top:20px;">
+              <div class="card-actions">
+                <form method="post" action={currentUrl} style="display:inline;">
+                  <input type="hidden" name="_action" value="preview" />
+                  <input type="hidden" name="_mode" value="schedules" />
+                  <button type="submit" class="btn ghost">Volver a previsualizar</button>
+                </form>
+
+                {(schPreviewResult.create.length > 0 || schPreviewResult.update.length > 0) && (
+                  <form method="post" action={currentUrl} style="display:inline;">
+                    <input type="hidden" name="_action" value="apply" />
+                    <input type="hidden" name="_mode" value="schedules" />
+                    <input type="hidden" name="import_create" value={JSON.stringify(schPreviewResult.create.map(e => e.row))} />
+                    <input type="hidden" name="import_update" value={JSON.stringify(schPreviewResult.update.map(e => e.row))} />
+                    <button
+                      type="submit"
+                      class="btn primary"
+                      onclick="return confirm('¿Aplicar {schPreviewResult.create.length} creaciones y {schPreviewResult.update.length} actualizaciones? Esto modifica los horarios de los barberos.');"
+                    >
+                      Aplicar importación ({schPreviewResult.create.length} crear, {schPreviewResult.update.length} actualizar)
+                    </button>
+                  </form>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {schApplyResult && (
+          <div class="import-result">
+            <div class="import-result-icon">&#10003;</div>
+            <div>
+              <h2>Importación completa</h2>
+              <p>
+                <strong>{schApplyResult.created}</strong> horario(s) creado(s),
+                <strong>{schApplyResult.updated}</strong> horario(s) actualizado(s).
+              </p>
+              {schApplyResult.errors.length > 0 && (
+                <div class="import-result-errors">
+                  <h3>Errores ({schApplyResult.errors.length})</h3>
+                  <ul>
+                    {schApplyResult.errors.map((e) => <li>{e}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div style="margin-top:12px;">
+                <a class="btn" href="/tenant/settings">Volver a configuración</a>
+                <a class="btn ghost" href="{currentUrl}?mode=schedules" style="margin-left:8px;">Importar más</a>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    )}
+  </section>
+</TenantBase>
+
+<style>
+  .tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border-soft);
+    margin-bottom: 20px;
+  }
+  .tab {
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--muted);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .tab:hover {
+    color: var(--fg-strong);
+  }
+  .tab-active {
+    color: var(--accent-fg);
+    border-bottom-color: var(--accent-fg);
+  }
+  .import-summary {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 12px 0;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .import-summary-item {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .import-summary-item strong {
+    color: var(--fg-strong);
+    font-weight: 600;
+  }
+  .import-summary-item.create strong { color: var(--success-fg); }
+  .import-summary-item.update strong { color: var(--warn-fg); }
+  .import-summary-item.unchanged strong { color: var(--muted-2); }
+  .import-summary-item.invalid strong { color: var(--danger-fg); }
+  .import-error-text {
+    color: var(--danger-fg);
+    font-size: 12px;
+  }
+  .import-result {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    padding: 20px;
+    background: var(--success-bg);
+    border: 1px solid var(--success-bg);
+    border-radius: var(--radius);
+    margin-top: 16px;
+  }
+  .import-result-icon {
+    font-size: 28px;
+    color: var(--success-fg);
+    line-height: 1;
+  }
+  .import-result-errors {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--danger-bg);
+    border-radius: var(--radius);
+  }
+  .import-result-errors h3 {
+    color: var(--danger-fg);
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+  .import-result-errors ul {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--danger-fg);
+    font-size: 12px;
+  }
+  .import-result-errors li { margin-bottom: 2px; }
+</style>

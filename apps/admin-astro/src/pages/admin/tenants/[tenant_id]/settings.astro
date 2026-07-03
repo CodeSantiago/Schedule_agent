@@ -1,0 +1,667 @@
+---
+import Base from "../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id } = Astro.params;
+if (!tenant_id) {
+  return new Response("Missing tenant id", { status: 400 });
+}
+
+interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+  timezone: string;
+}
+
+interface ProviderConfig {
+  id: string;
+  kind: string;
+  label: string;
+  provider_name: string;
+  credentials: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  is_active: boolean;
+}
+
+const STATUS_CHOICES = ["trial", "active", "suspended", "churned"];
+const KIND_LABELS: Record<string, string> = {
+  whatsapp: "WhatsApp",
+  llm: "LLM",
+  calendar: "Calendar",
+  sheets: "Google Sheets",
+  sms: "SMS",
+};
+const KIND_ORDER = ["whatsapp", "llm", "calendar", "sheets", "sms"];
+
+let tenant: Tenant | null = null;
+let configs: ProviderConfig[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+
+// Handle POSTs: update status, activate, delete a provider config,
+// soft-delete (archive) a tenant.
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    if (action === "status") {
+      const newStatus = String(form.get("new_status") ?? "trial");
+      await apiFetch(`/superadmin/tenants/${tenant_id}/status`, {
+        method: "PATCH",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      flash = "Estado actualizado.";
+    } else if (action === "activate") {
+      const cfgId = String(form.get("config_id") ?? "");
+      await apiFetch(
+        `/tenants/${tenant_id}/provider-configs/${cfgId}/activate`,
+        { method: "POST", request: Astro.request },
+      );
+      flash = "Provider config activated.";
+    } else if (action === "delete") {
+      const cfgId = String(form.get("config_id") ?? "");
+      await apiFetch(`/tenants/${tenant_id}/provider-configs/${cfgId}`, {
+        method: "DELETE",
+        request: Astro.request,
+      });
+      flash = "Provider config deleted.";
+    } else if (action === "archive") {
+      // Soft-delete: flips the tenant's status to "churned". The
+      // row and all child data stay in the database; an operator
+      // can later flip the status back via the lifecycle form.
+      await apiFetch(`/superadmin/tenants/${tenant_id}`, {
+        method: "DELETE",
+        request: Astro.request,
+      });
+      flash = "Negocio archivado. El estado pasó a churned; los datos se conservaron.";
+    } else if (action === "ops") {
+      const botEnabled = String(form.get("bot_enabled") ?? "false") === "on";
+      const closedRaw = String(form.get("closed_dates") ?? "").trim();
+      const closedDates = closedRaw
+        ? closedRaw.split(",").map((d) => d.trim()).filter(Boolean)
+        : [];
+      await apiFetch(`/superadmin/tenants/${tenant_id}/settings/operations`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ bot_enabled: botEnabled, closed_dates: closedDates }),
+      });
+      flash = "Operational settings updated.";
+    } else if (action === "data") {
+      const sourceOfTruth = String(form.get("source_of_truth") ?? "database");
+      const syncMode = String(form.get("sync_mode") ?? "manual");
+      await apiFetch(`/superadmin/tenants/${tenant_id}/settings/data`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ source_of_truth: sourceOfTruth, sync_mode: syncMode }),
+      });
+      flash = "Data & integration settings saved.";
+    } else if (action === "config") {
+      const greetingText = String(form.get("greeting_text") ?? "");
+      const behaviorNotes = String(form.get("behavior_notes") ?? "");
+      const displayName = String(form.get("display_name") ?? "");
+      const contactPhone = String(form.get("contact_phone") ?? "");
+      const bookingNotes = String(form.get("booking_notes") ?? "");
+      const location = String(form.get("location") ?? "");
+      const hours = String(form.get("hours") ?? "");
+      await apiFetch(`/superadmin/tenants/${tenant_id}/settings/config`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          greeting_text: greetingText,
+          behavior_notes: behaviorNotes,
+          display_name: displayName,
+          contact_phone: contactPhone,
+          booking_notes: bookingNotes,
+          location,
+          hours,
+        }),
+      });
+      flash = "Bot & business config saved.";
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Action failed (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  tenant = await apiJson<Tenant>(`/superadmin/tenants/${tenant_id}`, {
+    request: Astro.request,
+  });
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    return new Response("Negocio no encontrado", { status: 404 });
+  }
+  error = "No se pudo cargar el negocio.";
+}
+
+try {
+  configs = await apiJson<ProviderConfig[]>(
+    `/tenants/${tenant_id}/provider-configs`,
+    { request: Astro.request },
+  );
+} catch {
+  // Empty list is fine; the page renders the empty state.
+  configs = [];
+}
+
+// ── Operational settings ──────────────────────────────────────────────
+interface OperationalSettings {
+  bot_enabled: boolean;
+  closed_dates: string[];
+}
+
+let ops: OperationalSettings = { bot_enabled: true, closed_dates: [] };
+let opsError: string | null = null;
+
+try {
+  ops = await apiJson<OperationalSettings>(
+    `/superadmin/tenants/${tenant_id}/settings/operations`,
+    { request: Astro.request },
+  );
+} catch {
+  opsError = "No se pudo cargar la configuración operativa.";
+}
+
+// ── Data / integration settings ──────────────────────────────────────
+interface DataSettings {
+  source_of_truth: string;
+  sync_mode: string;
+  sheets_connected: boolean;
+}
+
+const SOURCE_OF_TRUTH_OPTIONS = [
+  { value: "database", label: "Base de datos (opción segura)", desc: "Todos los datos se guardan en la base de datos de la plataforma. Recomendado para la mayoría de los negocios." },
+  { value: "google_sheets", label: "Google Sheets", desc: "Los datos del negocio se leen o escriben desde una hoja de Google en lugar de la base de datos." },
+  { value: "hybrid", label: "Híbrido", desc: "Los datos se sincronizan entre la base de datos y Google Sheets." },
+];
+
+const SYNC_MODE_OPTIONS = [
+  { value: "manual", label: "Manual", desc: "Los cambios no se sincronizan automáticamente. La sincronización se ejecuta de forma manual." },
+  { value: "import_only", label: "Solo importar", desc: "Los datos se importan desde Sheets a la base de datos por evento o programación. No exporta." },
+  { value: "import_export", label: "Importar y exportar", desc: "Sincronización bidireccional entre la base de datos y Sheets por evento o programación." },
+];
+
+let dataSettings: DataSettings = { source_of_truth: "database", sync_mode: "manual", sheets_connected: false };
+let dataSettingsError: string | null = null;
+
+try {
+  dataSettings = await apiJson<DataSettings>(
+    `/superadmin/tenants/${tenant_id}/settings/data`,
+    { request: Astro.request },
+  );
+} catch {
+  dataSettingsError = "No se pudo cargar la configuración de datos e integraciones.";
+}
+
+// ── Bot + business config ─────────────────────────────────────────────
+interface BotConfigData {
+  greeting_text: string;
+  behavior_notes: string;
+  display_name: string;
+  contact_phone: string;
+  booking_notes: string;
+  location: string;
+  hours: string;
+}
+
+let cfg: BotConfigData = {
+  greeting_text: "",
+  behavior_notes: "",
+  display_name: "",
+  contact_phone: "",
+  booking_notes: "",
+  location: "",
+  hours: "",
+};
+let cfgError: string | null = null;
+
+try {
+  cfg = await apiJson<BotConfigData>(
+    `/superadmin/tenants/${tenant_id}/settings/config`,
+    { request: Astro.request },
+  );
+} catch {
+  cfgError = "No se pudo cargar la configuración del bot y del negocio.";
+}
+
+// ── Audit logs ────────────────────────────────────────────────────────
+interface AuditLogEntry {
+  id: string;
+  event_type: string;
+  level: string;
+  message: string;
+  actor_scope: string | null;
+  actor_id: string | null;
+  changed_fields: Record<string, unknown> | null;
+  details: Record<string, unknown>;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+let auditLogs: AuditLogEntry[] = [];
+let auditLogsError: string | null = null;
+
+try {
+  const logResp = await apiFetch(`/superadmin/tenants/${tenant_id}/logs?limit=20`, {
+    request: Astro.request,
+  });
+  const logData: AuditLogList = await logResp.json();
+  auditLogs = logData.entries;
+} catch {
+  auditLogsError = "No se pudieron cargar los registros de auditoría.";
+}
+
+// ── Kapso sandbox — minimal fields (mirrors new.astro/edit.astro) ──────
+// Used only for the summary display. Non-Kapso whatsapp configs fall
+// through to the raw count display (no schema).
+const KAPSO_CREDENTIAL_FIELDS = [
+  { name: "api_key", label: "Clave API", type: "password" as const, credential_key: "api_key" },
+  { name: "webhook_secret", label: "Secreto del webhook", type: "password" as const, credential_key: "webhook_secret" },
+];
+const KAPSO_SETTINGS_FIELDS = [
+  { name: "phone_number_id", label: "ID del número", type: "text" as const, settings_key: "phone_number_id" },
+  { name: "base_url", label: "URL base", type: "text" as const, settings_key: "base_url" },
+  { name: "sandbox", label: "Modo sandbox", type: "text" as const, settings_key: "sandbox" },
+  { name: "display_phone_number", label: "Teléfono mostrado", type: "text" as const, settings_key: "display_phone_number" },
+];
+const KAPSO_FIELDS = [...KAPSO_CREDENTIAL_FIELDS, ...KAPSO_SETTINGS_FIELDS];
+// ── LLM summary fields (simplified) ─────────────────────────────────────
+const LLM_FIELDS = [
+  { name: "api_key", label: "Clave API", type: "password" as const, credential_key: "api_key" },
+  { name: "model", label: "Modelo", type: "text" as const, settings_key: "model" },
+];
+type TypedField = {
+  name: string;
+  label: string;
+  type: "text" | "password" | "checkbox";
+  credential_key?: string;
+  settings_key?: string;
+};
+const TYPED_SCHEMAS: Record<string, TypedField[]> = {
+  whatsapp: KAPSO_FIELDS,
+  llm: LLM_FIELDS,
+};
+
+// Group configs by kind, preserving the canonical kind order.
+const grouped = new Map<string, ProviderConfig[]>();
+for (const c of configs) {
+  const arr = grouped.get(c.kind) ?? [];
+  arr.push(c);
+  grouped.set(c.kind, arr);
+}
+const orderedKinds = [
+  ...KIND_ORDER.filter((k) => grouped.has(k)),
+  ...Array.from(grouped.keys()).filter((k) => !KIND_ORDER.includes(k)),
+];
+
+function summaryFor(c: ProviderConfig) {
+  const schema = TYPED_SCHEMAS[c.kind];
+  if (!schema) return [];
+  const creds = c.credentials ?? {};
+  const settings = c.settings ?? {};
+  return schema.map((f) => {
+    const isCred = "credential_key" in f;
+    const key = isCred ? f.credential_key : f.settings_key;
+    if (!key) return { label: f.label, value: "No configurado", isSecret: false, muted: true };
+    const raw = isCred ? creds[key] : settings[key];
+    const isSecret = f.type === "password";
+    let value: string;
+    let muted = false;
+    if (isSecret) {
+      const has = raw !== undefined && raw !== null && raw !== "";
+      value = has ? "Configurado" : "No configurado";
+      muted = !has;
+    } else if (raw === undefined || raw === null || raw === "") {
+      value = "No configurado";
+      muted = true;
+    } else {
+      value = String(raw);
+    }
+    return { label: f.label, value, isSecret, muted };
+  });
+}
+---
+
+<Base title={tenant ? `${tenant.name} — Configuración` : "Configuración del negocio"} email={principal.email}>
+  <section class="card tenant-settings">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Configuración</span>
+        <h1>{tenant?.name ?? "Negocio"}</h1>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href="/admin">Volver a negocios</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    {tenant && (
+      <div class="ts-shell">
+        <section class="ts-main">
+          <div class="card-section ts-panel-section">
+            <div class="card-section-head">
+              <h2>Estado y operaciones</h2>
+            </div>
+            <div class="ts-compact-grid ts-compact-grid-2">
+              <div class="ts-mini-block">
+                <div class="ts-status-head">
+                  <span class={`status status-${tenant.status}`}>{tenant.status}</span>
+                  <span class="muted-2">·</span>
+                  <span class="muted-2">tz {tenant.timezone}</span>
+                </div>
+                <form method="post" class="form" action={`/admin/tenants/${tenant.id}/settings`}>
+                  <input type="hidden" name="_action" value="status" />
+                  <label>Ciclo de vida
+                    <select name="new_status">
+                      {STATUS_CHOICES.map((s) => (
+                        <option value={s} selected={tenant.status === s}>{s}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div class="form-footer">
+                    <button type="submit" class="btn primary small">Guardar</button>
+                  </div>
+                </form>
+              </div>
+
+              <div class="ts-mini-block">
+                {opsError && <p class="muted-2" style="font-size:12px;">{opsError}</p>}
+                <form method="post" class="form" action={`/admin/tenants/${tenant.id}/settings`}>
+                  <input type="hidden" name="_action" value="ops" />
+                  <label class="checkbox">
+                    <input type="checkbox" name="bot_enabled" checked={ops.bot_enabled} />
+                    Bot habilitado
+                  </label>
+                  <label>
+                    Fechas cerradas (YYYY-MM-DD separadas por coma)
+                    <input type="text" name="closed_dates" value={ops.closed_dates.join(", ")} placeholder="ej. 2026-12-25, 2026-07-04" />
+                  </label>
+                  <div class="form-footer">
+                    <button type="submit" class="btn primary small">Guardar</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <div class="card-section ts-panel-section">
+            <div class="card-section-head">
+              <h2>Bot y negocio</h2>
+            </div>
+            {cfgError && <p class="muted-2" style="font-size:12px;">{cfgError}</p>}
+            <form method="post" class="form" action={`/admin/tenants/${tenant.id}/settings`}>
+              <input type="hidden" name="_action" value="config" />
+              <div class="ts-config-grid">
+                <label>
+                  Nombre visible del negocio
+                  <input type="text" name="display_name" value={cfg.display_name} placeholder="ej. Barbería Central" />
+                </label>
+                <label>
+                  Teléfono de contacto
+                  <input type="text" name="contact_phone" value={cfg.contact_phone} placeholder="ej. +5491123456789" />
+                </label>
+                <label>
+                  Dirección / Ubicación
+                  <input type="text" name="location" value={cfg.location} placeholder="ej. Av. Corrientes 1234, CABA" />
+                </label>
+                <label>
+                  Horario laboral
+                  <input type="text" name="hours" value={cfg.hours} placeholder="ej. Lun-Vie 9:00-19:00, Sáb 9:00-14:00" />
+                </label>
+                <label class="full">
+                  Texto de saludo
+                  <textarea name="greeting_text" rows="2" placeholder="Hola, soy el bot de la barberia...">{cfg.greeting_text}</textarea>
+                </label>
+                <label>
+                  Notas de comportamiento del bot
+                  <textarea name="behavior_notes" rows="2" placeholder="Indicaciones para el bot, por ejemplo tono, reglas y horarios...">{cfg.behavior_notes}</textarea>
+                </label>
+                <label>
+                  Notas de reserva
+                  <textarea name="booking_notes" rows="2" placeholder="Notas que se mostrarán al cliente al reservar...">{cfg.booking_notes}</textarea>
+                </label>
+              </div>
+              <div class="form-footer">
+                <button type="submit" class="btn primary small">Guardar</button>
+              </div>
+            </form>
+          </div>
+
+          <section class="ts-providers ts-panel-section">
+            <div class="card-section">
+            <div class="ts-providers-head">
+              <h2>
+                Configuraciones de proveedores
+                <span class="ts-providers-sub">— una activa por tipo</span>
+              </h2>
+              <div class="card-actions">
+                <a class="btn small primary" href={`/admin/tenants/${tenant.id}/provider-configs/new`}>
+                  + Nueva
+                </a>
+              </div>
+            </div>
+            {configs.length === 0 ? (
+              <div class="empty-state" style="padding:14px;">
+                <p style="margin:0;">Todavía no hay configuraciones de proveedores.</p>
+              </div>
+            ) : (
+              orderedKinds.map((kind) => {
+                const rows = grouped.get(kind) ?? [];
+                const activeCount = rows.filter((r) => r.is_active).length;
+                return (
+                  <div class="provider-kind-group">
+                    <div class="provider-kind-group-head">
+                      <h3>
+                        <span class={`kind-chip kind-${kind}`}>{kind}</span>
+                        <span>{KIND_LABELS[kind] ?? kind}</span>
+                        <span class="provider-kind-count">
+                          {rows.length} · {activeCount} activas
+                        </span>
+                      </h3>
+                    </div>
+                    {rows.map((c) => {
+                      const summary = summaryFor(c);
+                      return (
+                        <div class={`provider-row ${c.is_active ? "is-active" : "is-inactive"}`}>
+                          <div>
+                            <div class="provider-label">
+                              <span>{c.label}</span>
+                              {c.is_active
+                                ? <span class="status status-active">Activa</span>
+                                : <span class="status status-suspended">Inactiva</span>}
+                            </div>
+                            <div class="provider-meta">
+                              <code>{c.provider_name}</code>
+                            </div>
+                          </div>
+                          <div>
+                            {summary.length > 0 ? (
+                              <dl class="provider-summary">
+                                {summary.map((s) => (
+                                  <div class={`provider-summary-item ${s.muted ? "is-muted" : ""}`}>
+                                    <dt>{s.label}</dt>
+                                    <dd>
+                                      {s.isSecret
+                                        ? <span class={`secret-flag ${s.muted ? "is-unset" : "is-set"}`}>{s.value}</span>
+                                        : <code>{s.value}</code>}
+                                    </dd>
+                                  </div>
+                                ))}
+                              </dl>
+                            ) : (
+                              <div class="provider-meta">
+                                {Object.keys(c.credentials ?? {}).length} credenciales · {Object.keys(c.settings ?? {}).length} ajustes
+                              </div>
+                            )}
+                          </div>
+                          <div class="provider-actions">
+                            <a class="btn small" href={`/admin/tenants/${tenant.id}/provider-configs/${c.id}/edit`}>
+                              Editar
+                            </a>
+                            {!c.is_active && (
+                              <form method="post" style="display:inline;" action={`/admin/tenants/${tenant.id}/settings`}>
+                                <input type="hidden" name="_action" value="activate" />
+                                <input type="hidden" name="config_id" value={c.id} />
+                                <button type="submit" class="btn small primary">Activar</button>
+                              </form>
+                            )}
+                            <form
+                              method="post"
+                              style="display:inline;"
+                              action={`/admin/tenants/${tenant.id}/settings`}
+                              onsubmit="return confirm('¿Eliminar esta configuración de proveedor?');"
+                            >
+                              <input type="hidden" name="_action" value="delete" />
+                              <input type="hidden" name="config_id" value={c.id} />
+                              <button type="submit" class="btn small danger">Eliminar</button>
+                            </form>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })
+            )}
+          </div>
+          </section>
+
+          <div class="card-section ts-logs-section ts-panel-section">
+            <details class="ts-collapsible">
+              <summary>Registros recientes</summary>
+              {auditLogsError && <p class="muted-2" style="font-size:12px;">{auditLogsError}</p>}
+              {auditLogs.length === 0 ? (
+                <div class="muted-2" style="font-size:12px; padding:6px 0;">
+                  Todavía no hay registros.
+                </div>
+              ) : (
+                <div class="ts-log-list">
+                  {auditLogs.map((e) => (
+                    <div class={`ts-log-row ts-log-${e.level}`}>
+                      <div class="ts-log-meta">
+                        <span class={`ts-log-level ts-log-level-${e.level}`}>{e.level}</span>
+                        <span class="ts-log-type">{e.event_type}</span>
+                        <span class="ts-log-date">{new Date(e.created_at).toLocaleString()}</span>
+                      </div>
+                      <div class="ts-log-msg">{e.message}</div>
+                      {e.duration_ms != null && (
+                        <div class="ts-log-duration">{e.duration_ms}ms</div>
+                      )}
+                      {e.actor_scope && (
+                        <div class="ts-log-actor">{e.actor_scope}{e.actor_id ? ` · ${e.actor_id.slice(0,8)}` : ""}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </details>
+          </div>
+        </section>
+
+        <aside class="ts-rail">
+          <div class="card-section ts-panel-section ts-rail-section">
+            <div class="card-section-head">
+              <h2>Integraciones</h2>
+            </div>
+            {dataSettingsError && <p class="muted-2" style="font-size:12px;">{dataSettingsError}</p>}
+            <form method="post" class="form" action={`/admin/tenants/${tenant.id}/settings`}>
+              <input type="hidden" name="_action" value="data" />
+
+              <label>
+                Fuente de verdad
+                <select name="source_of_truth">
+                  {SOURCE_OF_TRUTH_OPTIONS.map((opt) => (
+                    <option value={opt.value} selected={dataSettings.source_of_truth === opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Modo de sincronización
+                <select name="sync_mode">
+                  {SYNC_MODE_OPTIONS.map((opt) => (
+                    <option value={opt.value} selected={dataSettings.sync_mode === opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div class="ts-sheets-status">
+                <span class="ts-sheets-label">Google Sheets</span>
+                {dataSettings.sheets_connected
+                  ? <span class="status status-active">Conectado</span>
+                  : <span class="status status-suspended">No conectado</span>}
+              </div>
+
+              <div class="form-footer">
+                <a class="btn small ghost" href={`/admin/tenants/${tenant.id}/provider-configs/new?kind=sheets`}>
+                  {dataSettings.sheets_connected ? "Gestionar Sheets" : "Conectar Sheets"}
+                </a>
+                <button type="submit" class="btn primary small">Guardar</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="card-section ts-panel-section ts-rail-section">
+            <div class="card-section-head">
+              <h2>Herramientas</h2>
+            </div>
+            <div class="ts-tool-grid">
+              <a class="btn small" href={`/admin/tenants/${tenant.id}/health`}>Centro de salud</a>
+              <a class="btn small" href={`/admin/tenants/${tenant.id}/users`}>Usuarios</a>
+              <a class="btn small" href={`/admin/tenants/${tenant.id}/feature-flags`}>Feature flags</a>
+              <a class="btn small" href={`/admin/tenants/${tenant.id}/templates`}>Plantillas</a>
+            </div>
+          </div>
+
+          {tenant.status !== "churned" ? (
+            <div class="ts-archive ts-panel-section">
+              <div class="ts-archive-text">
+                Archivar: cambia el estado a <strong>churned</strong>. Los datos se conservan y se puede revertir.
+              </div>
+              <form
+                class="ts-archive-form"
+                method="post"
+                action={`/admin/tenants/${tenant.id}/settings`}
+                onsubmit="return confirm('¿Archivar este negocio? Su estado pasará a churned. Los datos se conservarán y se podrá reactivar luego.');"
+              >
+                <input type="hidden" name="_action" value="archive" />
+                <button type="submit" class="btn danger small">Archivar</button>
+              </form>
+            </div>
+          ) : (
+            <div class="ts-archive ts-panel-section">
+              <div class="ts-archive-text">
+                <strong>Archivado.</strong> Usá el formulario de estado para restaurarlo.
+              </div>
+            </div>
+          )}
+        </aside>
+      </div>
+    )}
+  </section>
+</Base>

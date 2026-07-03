@@ -1,0 +1,816 @@
+---
+import TenantBase from "../../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+const { id } = Astro.params;
+if (!id) {
+  return new Response("Missing barber id", { status: 400 });
+}
+
+const barberId = id;
+const tid = principal.tenant_id!;
+
+// ── Interfaces ──────────────────────────────────────────────────────────
+
+interface Barber {
+  id: string;
+  name: string;
+  restrictions: string | null;
+  is_active: boolean;
+}
+
+interface Schedule {
+  id: string;
+  weekday: string;
+  start_time: string;
+  end_time: string;
+}
+
+interface Absence {
+  id: string;
+  absence_date: string;
+  start_time: string | null;
+  end_time: string | null;
+  reason: string | null;
+}
+
+interface ExtraHour {
+  id: string;
+  extra_date: string;
+  start_time: string;
+  end_time: string;
+  reason: string | null;
+}
+
+const DAY_LABELS: Record<string, string> = {
+  mon: "Lunes",
+  tue: "Martes",
+  wed: "Miércoles",
+  thu: "Jueves",
+  fri: "Viernes",
+  sat: "Sábado",
+  sun: "Domingo",
+};
+
+const DAY_ORDER: Record<string, number> = {
+  mon: 0, tue: 1, wed: 2, thu: 3, fri: 4, sat: 5, sun: 6,
+};
+
+// ── State ───────────────────────────────────────────────────────────────
+
+let barber: Barber | null = null;
+let schedules: Schedule[] = [];
+let absences: Absence[] = [];
+let extraHours: ExtraHour[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+
+// ── Parse edit mode from query params ───────────────────────────────────
+const url = new URL(Astro.request.url);
+const editingScheduleId = url.searchParams.get("edit_schedule");
+const editingAbsenceId = url.searchParams.get("edit_absence");
+const editingExtraHourId = url.searchParams.get("edit_extra_hour");
+const currentPath = Astro.url.pathname;
+
+// ── Helper: strip seconds from time string ──────────────────────────────
+function fmtTime(value: string | null): string {
+  if (!value) return "";
+  return value.substring(0, 5);
+}
+
+// ── Handle POST actions ────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    // ── Schedule actions ───────────────────────────────────────────
+    if (action === "create-schedule") {
+      const weekday = String(form.get("weekday") ?? "").trim().toLowerCase();
+      const startTime = String(form.get("start_time") ?? "").trim();
+      const endTime = String(form.get("end_time") ?? "").trim();
+
+      if (!weekday || !startTime || !endTime) {
+        error = "El día, la hora de inicio y la hora de fin son obligatorios.";
+      } else {
+        await apiFetch(`/tenants/${tid}/barbers/${barberId}/schedules`, {
+          method: "POST",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            weekday,
+            start_time: startTime,
+            end_time: endTime,
+          }),
+        });
+        flash = "Bloque de horario agregado.";
+      }
+    } else if (action === "update-schedule") {
+      const scheduleId = String(form.get("schedule_id") ?? "");
+      const startTime = String(form.get("start_time") ?? "").trim();
+      const endTime = String(form.get("end_time") ?? "").trim();
+
+      if (!scheduleId) {
+        error = "Falta el ID del horario.";
+      } else if (!startTime || !endTime) {
+        error = "La hora de inicio y fin son obligatorias.";
+      } else {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/schedules/${scheduleId}`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              start_time: startTime,
+              end_time: endTime,
+            }),
+          },
+        );
+        flash = "Horario actualizado.";
+      }
+    } else if (action === "delete-schedule") {
+      const scheduleId = String(form.get("schedule_id") ?? "");
+      if (scheduleId) {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/schedules/${scheduleId}`,
+          { method: "DELETE", request: Astro.request },
+        );
+        flash = "Bloque de horario eliminado.";
+      }
+    }
+
+    // ── Absence actions ────────────────────────────────────────────
+    else if (action === "create-absence") {
+      const absenceDate = String(form.get("absence_date") ?? "").trim();
+      const startTime = String(form.get("start_time") ?? "").trim() || null;
+      const endTime = String(form.get("end_time") ?? "").trim() || null;
+      const reason = String(form.get("reason") ?? "").trim() || null;
+
+      if (!absenceDate) {
+        error = "La fecha es obligatoria.";
+      } else {
+        const body: Record<string, unknown> = {
+          absence_date: absenceDate,
+          reason,
+        };
+        if (startTime) body.start_time = startTime;
+        if (endTime) body.end_time = endTime;
+        await apiFetch(`/tenants/${tid}/barbers/${barberId}/absences`, {
+          method: "POST",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        flash = "Ausencia agregada.";
+      }
+    } else if (action === "update-absence") {
+      const absenceId = String(form.get("absence_id") ?? "");
+      const absenceDate =
+        String(form.get("absence_date") ?? "").trim() || null;
+      const startTime =
+        String(form.get("start_time") ?? "").trim() || null;
+      const endTime =
+        String(form.get("end_time") ?? "").trim() || null;
+      const reason =
+        String(form.get("reason") ?? "").trim() || null;
+
+      if (!absenceId) {
+        error = "Falta el ID de la ausencia.";
+      } else {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/absences/${absenceId}`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              absence_date: absenceDate,
+              start_time: startTime,
+              end_time: endTime,
+              reason,
+            }),
+          },
+        );
+        flash = "Ausencia actualizada.";
+      }
+    } else if (action === "delete-absence") {
+      const absenceId = String(form.get("absence_id") ?? "");
+      if (absenceId) {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/absences/${absenceId}`,
+          { method: "DELETE", request: Astro.request },
+        );
+        flash = "Ausencia eliminada.";
+      }
+    }
+
+    // ── Extra hour actions ─────────────────────────────────────────
+    else if (action === "create-extra-hour") {
+      const extraDate = String(form.get("extra_date") ?? "").trim();
+      const startTime = String(form.get("start_time") ?? "").trim();
+      const endTime = String(form.get("end_time") ?? "").trim();
+      const reason = String(form.get("reason") ?? "").trim() || null;
+
+      if (!extraDate || !startTime || !endTime) {
+        error = "La fecha, hora de inicio y hora de fin son obligatorias.";
+      } else {
+        await apiFetch(`/tenants/${tid}/barbers/${barberId}/extra-hours`, {
+          method: "POST",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            extra_date: extraDate,
+            start_time: startTime,
+            end_time: endTime,
+            reason,
+          }),
+        });
+        flash = "Hora extra agregada.";
+      }
+    } else if (action === "update-extra-hour") {
+      const extraHourId = String(form.get("extra_hour_id") ?? "");
+      const extraDate =
+        String(form.get("extra_date") ?? "").trim() || null;
+      const startTime =
+        String(form.get("start_time") ?? "").trim() || null;
+      const endTime =
+        String(form.get("end_time") ?? "").trim() || null;
+      const reason =
+        String(form.get("reason") ?? "").trim() || null;
+
+      if (!extraHourId) {
+        error = "Falta el ID de la hora extra.";
+      } else {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/extra-hours/${extraHourId}`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              extra_date: extraDate,
+              start_time: startTime,
+              end_time: endTime,
+              reason,
+            }),
+          },
+        );
+        flash = "Hora extra actualizada.";
+      }
+    } else if (action === "delete-extra-hour") {
+      const extraHourId = String(form.get("extra_hour_id") ?? "");
+      if (extraHourId) {
+        await apiFetch(
+          `/tenants/${tid}/barbers/${barberId}/extra-hours/${extraHourId}`,
+          { method: "DELETE", request: Astro.request },
+        );
+        flash = "Hora extra eliminada.";
+      }
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail =
+        (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Fetch data ──────────────────────────────────────────────────────────
+try {
+  const [barberData, schedulesData, absencesData, extraHoursData] =
+    await Promise.all([
+      apiJson<Barber>(`/tenants/${tid}/barbers/${barberId}`, {
+        request: Astro.request,
+      }),
+      apiJson<Schedule[]>(`/tenants/${tid}/barbers/${barberId}/schedules`, {
+        request: Astro.request,
+      }),
+      apiJson<Absence[]>(`/tenants/${tid}/barbers/${barberId}/absences`, {
+        request: Astro.request,
+      }),
+      apiJson<ExtraHour[]>(
+        `/tenants/${tid}/barbers/${barberId}/extra-hours`,
+        { request: Astro.request },
+      ),
+    ]);
+  barber = barberData;
+  schedules = schedulesData;
+  absences = absencesData;
+  extraHours = extraHoursData;
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    return new Response("Barbero no encontrado", { status: 404 });
+  }
+  error = "No se pudieron cargar los datos del barbero.";
+}
+
+// Sort schedules by weekday order
+const sortedSchedules = [...schedules].sort(
+  (a, b) => (DAY_ORDER[a.weekday] ?? 99) - (DAY_ORDER[b.weekday] ?? 99),
+);
+
+// Sort absences by date ascending
+const sortedAbsences = [...absences].sort(
+  (a, b) => a.absence_date.localeCompare(b.absence_date),
+);
+
+// Sort extra hours by date ascending
+const sortedExtraHours = [...extraHours].sort(
+  (a, b) => a.extra_date.localeCompare(b.extra_date),
+);
+---
+
+<TenantBase
+  title={
+    barber
+      ? `${barber.name} — Horario y ausencias — Barber Agent`
+      : "Detalle del barbero — Barber Agent"
+  }
+  email={principal.email}
+>
+  <!-- ── Header ─────────────────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Barberos</span>
+        <h1>{barber?.name ?? "Barbero"}</h1>
+        <p class="card-subtitle">
+          Gestiona el horario semanal, ausencias y horas extra.
+          {barber?.restrictions
+            ? <span class="muted-2">Restricciones: {barber.restrictions}</span>
+            : null}
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/barbers/">Volver a barberos</a>
+      </div>
+    </div>
+  </section>
+
+  {flash && <div class="flash">{flash}</div>}
+  {error && <p class="form-error">{error}</p>}
+
+  <!-- ================================================================
+       SECTION A: Weekly Schedule Grid
+       ================================================================ -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <h2>Horario semanal</h2>
+        <p class="card-subtitle">
+          Bloques de horario semanal recurrentes. Agrega múltiples bloques por día según sea necesario.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Create schedule form ─────────────────────────────────── -->
+    <form method="post" action={currentPath} class="form">
+      <input type="hidden" name="_action" value="create-schedule" />
+      <div class="form-grid-2">
+        <label>
+          Día
+          <select name="weekday" required>
+            <option value="">Seleccionar día…</option>
+            <option value="mon">Lunes</option>
+            <option value="tue">Martes</option>
+            <option value="wed">Miércoles</option>
+            <option value="thu">Jueves</option>
+            <option value="fri">Viernes</option>
+            <option value="sat">Sábado</option>
+            <option value="sun">Domingo</option>
+          </select>
+        </label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end;">
+          <label>
+            Inicio
+            <input type="time" name="start_time" required />
+          </label>
+          <label>
+            Fin
+            <input type="time" name="end_time" required />
+          </label>
+        </div>
+      </div>
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Agregar bloque</button>
+      </div>
+    </form>
+
+    <!-- ── Schedule entries ─────────────────────────────────────── -->
+    <div class="card-section">
+      {sortedSchedules.length === 0 ? (
+        <div class="empty-state">
+          <p>Aún no hay entradas de horario. Crea una arriba.</p>
+        </div>
+      ) : (
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>Día</th>
+              <th>Inicio</th>
+              <th>Fin</th>
+              <th class="actions">Acciones</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedSchedules.map((s) => (
+              <tr>
+                {editingScheduleId === s.id ? (
+                  <>
+                    <td><strong>{DAY_LABELS[s.weekday] ?? s.weekday}</strong></td>
+                    <td colspan="3" style="padding:0;">
+                      <form
+                        method="post"
+                        action={currentPath}
+                        style="display:flex;gap:8px;align-items:center;padding:10px 12px;"
+                      >
+                        <input type="hidden" name="_action" value="update-schedule" />
+                        <input type="hidden" name="schedule_id" value={s.id} />
+                        <input
+                          type="time"
+                          name="start_time"
+                          value={fmtTime(s.start_time)}
+                          required
+                          style="width:110px;"
+                        />
+                          <span class="muted-2">a</span>
+                        <input
+                          type="time"
+                          name="end_time"
+                          value={fmtTime(s.end_time)}
+                          required
+                          style="width:110px;"
+                        />
+                        <button type="submit" class="btn small primary">
+                          Guardar
+                        </button>
+                        <a href={currentPath} class="btn small ghost">Cancelar</a>
+                      </form>
+                    </td>
+                  </>
+                ) : (
+                  <>
+                    <td><strong>{DAY_LABELS[s.weekday] ?? s.weekday}</strong></td>
+                    <td>{fmtTime(s.start_time)}</td>
+                    <td>{fmtTime(s.end_time)}</td>
+                    <td class="actions">
+                      <a
+                        href={`${currentPath}?edit_schedule=${s.id}`}
+                        class="btn small"
+                      >
+                        Editar
+                      </a>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="delete-schedule" />
+                        <input type="hidden" name="schedule_id" value={s.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Eliminar este bloque de horario?')"
+                        >
+                          Eliminar
+                        </button>
+                      </form>
+                    </td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </section>
+
+  <!-- ================================================================
+       SECTION B: Absences
+       ================================================================ -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <h2>Ausencias</h2>
+        <p class="card-subtitle">
+          No disponibilidad por fecha específica: vacaciones, días de enfermedad, tiempo libre.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Create absence form ──────────────────────────────────── -->
+    <form method="post" action={currentPath} class="form">
+      <input type="hidden" name="_action" value="create-absence" />
+      <div class="form-grid-2">
+          <label>
+            Fecha
+            <input type="date" name="absence_date" required />
+          </label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <label>
+              Inicio (opcional)
+              <input type="time" name="start_time" />
+            </label>
+            <label>
+              Fin (opcional)
+              <input type="time" name="end_time" />
+            </label>
+          </div>
+        </div>
+        <label>
+          Motivo
+          <input
+            type="text"
+            name="reason"
+            maxlength="120"
+            placeholder="ej. Vacaciones, día de enfermedad…"
+          />
+        </label>
+        <div class="form-footer">
+          <span class="form-footer-hint">
+            Deja los campos de hora vacíos para una ausencia de día completo.
+          </span>
+          <button type="submit" class="btn primary">Agregar ausencia</button>
+        </div>
+    </form>
+
+    <!-- ── Absence entries ──────────────────────────────────────── -->
+    <div class="card-section">
+      {sortedAbsences.length === 0 ? (
+        <div class="empty-state">
+          <p>No hay ausencias registradas.</p>
+        </div>
+      ) : (
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Start</th>
+              <th>End</th>
+              <th>Reason</th>
+              <th class="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedAbsences.map((a) => (
+              <tr>
+                {editingAbsenceId === a.id ? (
+                  <>
+                    <td colspan="4" style="padding:0;">
+                      <form
+                        method="post"
+                        action={currentPath}
+                        style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;"
+                      >
+                        <input type="hidden" name="_action" value="update-absence" />
+                        <input type="hidden" name="absence_id" value={a.id} />
+                        <input
+                          type="date"
+                          name="absence_date"
+                          value={a.absence_date}
+                          required
+                          style="width:140px;"
+                        />
+                        <input
+                          type="time"
+                          name="start_time"
+                          value={fmtTime(a.start_time)}
+                          style="width:110px;"
+                        />
+                        <input
+                          type="time"
+                          name="end_time"
+                          value={fmtTime(a.end_time)}
+                          style="width:110px;"
+                        />
+                        <input
+                          type="text"
+                          name="reason"
+                          value={a.reason ?? ""}
+                          maxlength="120"
+                          placeholder="Motivo"
+                          style="width:160px;"
+                        />
+                        <button type="submit" class="btn small primary">
+                          Guardar
+                        </button>
+                        <a href={currentPath} class="btn small ghost">Cancelar</a>
+                      </form>
+                    </td>
+                    <td class="actions" style="vertical-align:middle;">
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="delete-absence" />
+                        <input type="hidden" name="absence_id" value={a.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Eliminar esta ausencia?')"
+                        >
+                          Eliminar
+                        </button>
+                      </form>
+                    </td>
+                  </>
+                ) : (
+                  <>
+                    <td><strong>{a.absence_date}</strong></td>
+                    <td>{fmtTime(a.start_time) || <span class="muted-2">Todo el día</span>}</td>
+                    <td>{fmtTime(a.end_time) || <span class="muted-2">Todo el día</span>}</td>
+                    <td>{a.reason ?? <span class="muted-2">—</span>}</td>
+                    <td class="actions">
+                      <a
+                        href={`${currentPath}?edit_absence=${a.id}`}
+                        class="btn small"
+                      >
+                        Editar
+                      </a>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="delete-absence" />
+                        <input type="hidden" name="absence_id" value={a.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Eliminar esta ausencia?')"
+                        >
+                          Eliminar
+                        </button>
+                      </form>
+                    </td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </section>
+
+  <!-- ================================================================
+       SECTION C: Extra Hours
+       ================================================================ -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <h2>Horas extra</h2>
+        <p class="card-subtitle">
+          Tiempo de trabajo adicional fuera del horario regular.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Create extra hour form ───────────────────────────────── -->
+    <form method="post" action={currentPath} class="form">
+      <input type="hidden" name="_action" value="create-extra-hour" />
+      <div class="form-grid-2">
+          <label>
+            Fecha
+            <input type="date" name="extra_date" required />
+          </label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <label>
+              Inicio
+              <input type="time" name="start_time" required />
+            </label>
+            <label>
+              Fin
+              <input type="time" name="end_time" required />
+            </label>
+          </div>
+        </div>
+        <label>
+          Motivo
+          <input
+            type="text"
+            name="reason"
+            maxlength="120"
+            placeholder="ej. Cobertura sábado, horas extra…"
+          />
+        </label>
+        <div class="form-footer">
+          <button type="submit" class="btn primary">Agregar hora extra</button>
+        </div>
+    </form>
+
+    <!-- ── Extra hour entries ───────────────────────────────────── -->
+    <div class="card-section">
+      {sortedExtraHours.length === 0 ? (
+        <div class="empty-state">
+          <p>No hay horas extra registradas.</p>
+        </div>
+      ) : (
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>Fecha</th>
+              <th>Inicio</th>
+              <th>Fin</th>
+              <th>Motivo</th>
+              <th class="actions">Acciones</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedExtraHours.map((eh) => (
+              <tr>
+                {editingExtraHourId === eh.id ? (
+                  <>
+                    <td colspan="4" style="padding:0;">
+                      <form
+                        method="post"
+                        action={currentPath}
+                        style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;"
+                      >
+                        <input type="hidden" name="_action" value="update-extra-hour" />
+                        <input type="hidden" name="extra_hour_id" value={eh.id} />
+                        <input
+                          type="date"
+                          name="extra_date"
+                          value={eh.extra_date}
+                          required
+                          style="width:140px;"
+                        />
+                        <input
+                          type="time"
+                          name="start_time"
+                          value={fmtTime(eh.start_time)}
+                          required
+                          style="width:110px;"
+                        />
+                        <input
+                          type="time"
+                          name="end_time"
+                          value={fmtTime(eh.end_time)}
+                          required
+                          style="width:110px;"
+                        />
+                        <input
+                          type="text"
+                          name="reason"
+                          value={eh.reason ?? ""}
+                          maxlength="120"
+                          placeholder="Motivo"
+                          style="width:160px;"
+                        />
+                        <button type="submit" class="btn small primary">
+                          Guardar
+                        </button>
+                        <a href={currentPath} class="btn small ghost">Cancelar</a>
+                      </form>
+                    </td>
+                    <td class="actions" style="vertical-align:middle;">
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="delete-extra-hour" />
+                        <input type="hidden" name="extra_hour_id" value={eh.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Eliminar esta hora extra?')"
+                        >
+                          Eliminar
+                        </button>
+                      </form>
+                    </td>
+                  </>
+                ) : (
+                  <>
+                    <td><strong>{eh.extra_date}</strong></td>
+                    <td>{fmtTime(eh.start_time)}</td>
+                    <td>{fmtTime(eh.end_time)}</td>
+                    <td>{eh.reason ?? <span class="muted-2">—</span>}</td>
+                    <td class="actions">
+                      <a
+                        href={`${currentPath}?edit_extra_hour=${eh.id}`}
+                        class="btn small"
+                      >
+                        Editar
+                      </a>
+                      <form method="post" action={currentPath} style="display:inline;">
+                        <input type="hidden" name="_action" value="delete-extra-hour" />
+                        <input type="hidden" name="extra_hour_id" value={eh.id} />
+                        <button
+                          type="submit"
+                          class="btn small danger"
+                          onclick="return confirm('¿Eliminar esta hora extra?')"
+                        >
+                          Eliminar
+                        </button>
+                      </form>
+                    </td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </section>
+</TenantBase>

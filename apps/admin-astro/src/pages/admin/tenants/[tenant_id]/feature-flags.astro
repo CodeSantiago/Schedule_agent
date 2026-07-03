@@ -1,0 +1,111 @@
+---
+import Base from "../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id } = Astro.params;
+if (!tenant_id) {
+  return new Response("Falta el identificador del negocio", { status: 400 });
+}
+
+interface FeatureFlagsData {
+  features: Record<string, boolean>;
+  available_flags: string[];
+}
+
+let data: FeatureFlagsData = { features: {}, available_flags: [] };
+let flash: string | null = null;
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const formData = await Astro.request.formData();
+  const features: Record<string, boolean> = {};
+  const availableRaw = String(formData.get("_available") ?? "");
+  const available = availableRaw ? availableRaw.split(",") : [];
+
+  for (const flag of available) {
+    features[flag] = String(formData.get(`flag_${flag}`) ?? "") === "on";
+  }
+
+  try {
+    data = await apiJson<FeatureFlagsData>(
+      `/superadmin/tenants/${tenant_id}/settings/features`,
+      {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ features }),
+      },
+    );
+    flash = "Banderas de funciones actualizadas.";
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  data = await apiJson<FeatureFlagsData>(
+    `/superadmin/tenants/${tenant_id}/settings/features`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar las banderas de funciones (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+
+const FLAG_LABELS: Record<string, string> = {
+  cb_booking: "Reserva Corte + Barba",
+  whatsapp_bot: "Bot de WhatsApp",
+  online_payments: "Pagos en línea",
+  reports: "Reportes y analítica",
+  advanced_scheduling: "Agenda avanzada",
+};
+
+function flagLabel(key: string): string {
+  return FLAG_LABELS[key] ?? key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+}
+---
+
+<Base title="Banderas de funciones — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Configuración</span>
+        <h1>Banderas de funciones</h1>
+        <p class="card-subtitle">Activá o desactivá funciones para este negocio.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href={`/admin/tenants/${tenant_id}/settings`}>Volver a configuración</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <form method="post" class="form" style="max-width:500px;">
+      <input type="hidden" name="_available" value={data.available_flags.join(",")} />
+      {data.available_flags.map(flag => (
+        <label class="checkbox">
+          <input type="checkbox" name={`flag_${flag}`} checked={data.features[flag] ?? false} />
+          {flagLabel(flag)}
+        </label>
+      ))}
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Guardar banderas</button>
+      </div>
+    </form>
+  </section>
+</Base>

@@ -1,0 +1,35 @@
+---
+import "../styles/app.css";
+import Topbar from "../components/Topbar.astro";
+
+interface Props {
+  title?: string;
+  /** Set when the tenant user is authenticated. */
+  email?: string | null;
+  /** Context label: "admin" (platform console) or "tenant" (business workspace). */
+  context?: "admin" | "tenant";
+}
+
+const { title = "Barber Agent", email = null, context = "tenant" } = Astro.props;
+---
+
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+    />
+  </head>
+  <body data-context={context}>
+    <Topbar email={email} context={context} />
+    <main class="page">
+      <slot />
+    </main>
+  </body>
+</html>

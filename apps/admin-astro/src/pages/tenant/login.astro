@@ -1,0 +1,64 @@
+---
+import Base from "../../layouts/Base.astro";
+import {
+  getTenantPrincipal,
+  tenantLogin,
+  setTenantSessionCookie,
+} from "../../lib/session";
+
+let error: string | null = null;
+let email = "";
+
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const submittedEmail = String(form.get("email") ?? "").trim();
+  const password = String(form.get("password") ?? "");
+  email = submittedEmail;
+
+  if (!submittedEmail || !password) {
+    error = "El correo y la contraseña son obligatorios.";
+  } else {
+    const result = await tenantLogin(submittedEmail, password);
+    if (result.ok && result.token && result.email && result.tenant_id) {
+      setTenantSessionCookie(
+        Astro.cookies,
+        result.token,
+        result.email,
+        result.tenant_id,
+      );
+      return Astro.redirect("/tenant/dashboard");
+    }
+    error = result.error ?? "No se pudo iniciar sesión.";
+  }
+}
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal !== null) {
+  return Astro.redirect("/tenant/dashboard");
+}
+---
+
+<Base title="Iniciar sesión — Barber Agent" email={null} context="tenant">
+  <section class="card narrow">
+    <span class="card-eyebrow">Cuenta del negocio</span>
+    <h1>Iniciar sesión</h1>
+    <p class="card-subtitle">
+      Bienvenido de nuevo. Usa tus credenciales del negocio para continuar.
+    </p>
+    {error && <p class="form-error">{error}</p>}
+    <form method="post" action="/tenant/login" class="form">
+      <label
+        >Correo electrónico
+        <input type="email" name="email" value={email} required autofocus />
+      </label>
+      <label
+        >Contraseña
+        <input type="password" name="password" required />
+      </label>
+      <div class="form-footer">
+        <a class="btn small ghost" href="/">Cancelar</a>
+        <button type="submit" class="btn primary">Iniciar sesión</button>
+      </div>
+    </form>
+  </section>
+</Base>

@@ -1,0 +1,386 @@
+---
+import TenantBase from "../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface HolidayRange {
+  start: string;
+  end: string;
+  reason: string | null;
+}
+
+interface BarberOverride {
+  barber_id: string;
+  date_from: string | null;
+  date_to: string | null;
+  is_disabled: boolean;
+  reason: string | null;
+}
+
+interface CalendarOverridesData {
+  holiday_ranges: HolidayRange[];
+  barber_overrides: BarberOverride[];
+  closed_dates: string[];
+}
+
+interface Barber {
+  id: string;
+  name: string;
+  restrictions: string | null;
+  is_active: boolean;
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+let overrides: CalendarOverridesData = { holiday_ranges: [], barber_overrides: [], closed_dates: [] };
+let barbers: Barber[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+let warn: string | null = null;
+
+const url = Astro.url.pathname;
+
+// ── Handle POST ────────────────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    // Fetch current state as base.
+    const current = await apiJson<CalendarOverridesData>(
+      `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+      { request: Astro.request },
+    );
+
+    if (action === "add_holiday") {
+      const start = String(form.get("holiday_start") ?? "").trim();
+      const end = String(form.get("holiday_end") ?? "").trim();
+      const reason = String(form.get("holiday_reason") ?? "").trim();
+
+      if (!start || !end) {
+        error = "Las fechas de inicio y fin son obligatorias.";
+      } else if (start > end) {
+        error = "La fecha de fin debe ser igual o posterior a la fecha de inicio.";
+      } else {
+        const newRange: HolidayRange = { start, end, reason: reason || null };
+        const updated = await apiJson<CalendarOverridesData>(
+          `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              holiday_ranges: [...(current.holiday_ranges ?? []), newRange],
+            }),
+          },
+        );
+        overrides = updated;
+        barbers = await apiJson<Barber[]>(`/tenants/${principal.tenant_id}/barbers`, { request: Astro.request });
+        flash = "Rango de feriado agregado.";
+      }
+    } else if (action === "delete_holiday") {
+      const index = parseInt(String(form.get("holiday_index") ?? "-1"), 10);
+      if (index >= 0 && index < (current.holiday_ranges ?? []).length) {
+        const updatedRanges = [...(current.holiday_ranges ?? [])];
+        updatedRanges.splice(index, 1);
+        const updated = await apiJson<CalendarOverridesData>(
+          `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ holiday_ranges: updatedRanges }),
+          },
+        );
+        overrides = updated;
+        barbers = await apiJson<Barber[]>(`/tenants/${principal.tenant_id}/barbers`, { request: Astro.request });
+        flash = "Rango de feriado eliminado.";
+      }
+    } else if (action === "update_barber_override") {
+      const barberId = String(form.get("barber_id") ?? "");
+      const dateFrom = String(form.get("date_from") ?? "").trim() || null;
+      const dateTo = String(form.get("date_to") ?? "").trim() || null;
+      const isDisabled = String(form.get("is_disabled") ?? "true") === "on";
+      const reason = String(form.get("override_reason") ?? "").trim() || null;
+
+      if (!barberId) {
+        error = "El barbero es obligatorio.";
+      } else {
+        // Replace or add this barber's override.
+        const existingOverrides = [...(current.barber_overrides ?? [])];
+        const existingIdx = existingOverrides.findIndex(o => o.barber_id === barberId);
+        const newOverride: BarberOverride = { barber_id: barberId, date_from: dateFrom, date_to: dateTo, is_disabled: isDisabled, reason };
+
+        if (existingIdx >= 0) {
+          existingOverrides[existingIdx] = newOverride;
+        } else {
+          existingOverrides.push(newOverride);
+        }
+
+        const updated = await apiJson<CalendarOverridesData>(
+          `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+          {
+            method: "PUT",
+            request: Astro.request,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ barber_overrides: existingOverrides }),
+          },
+        );
+        overrides = updated;
+        barbers = await apiJson<Barber[]>(`/tenants/${principal.tenant_id}/barbers`, { request: Astro.request });
+        flash = "Excepción de barbero guardada.";
+      }
+    } else if (action === "remove_barber_override") {
+      const barberId = String(form.get("barber_id") ?? "");
+      const existingOverrides = [...(current.barber_overrides ?? [])].filter(o => o.barber_id !== barberId);
+
+      const updated = await apiJson<CalendarOverridesData>(
+        `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+        {
+          method: "PUT",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ barber_overrides: existingOverrides }),
+        },
+      );
+      overrides = updated;
+      barbers = await apiJson<Barber[]>(`/tenants/${principal.tenant_id}/barbers`, { request: Astro.request });
+      flash = "Excepción de barbero eliminada.";
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Fetch current data ────────────────────────────────────────────────────
+if (Astro.request.method !== "POST" || overrides.holiday_ranges.length === 0 && !flash && !error) {
+  try {
+    overrides = await apiJson<CalendarOverridesData>(
+      `/tenants/${principal.tenant_id}/settings/operations/calendar`,
+      { request: Astro.request },
+    );
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      warn = `No se pudieron cargar las excepciones de calendario (${err.status}).`;
+    } else {
+      warn = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  barbers = await apiJson<Barber[]>(`/tenants/${principal.tenant_id}/barbers`, { request: Astro.request });
+} catch {
+  // Non-fatal.
+}
+
+function fmtDate(raw: string): string {
+  return raw.substring(0, 10);
+}
+---
+
+<TenantBase title="Excepciones de calendario — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Operaciones</span>
+        <h1>Excepciones de calendario</h1>
+        <p class="card-subtitle">
+          Gestiona cierres por feriados, excepciones de disponibilidad de barberos y fechas cerradas para reservas.
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/settings">Volver a configuración</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+    {warn && <p class="form-error">{warn}</p>}
+
+    <!-- ── Holiday Ranges ───────────────────────────────────────────── -->
+    <div class="card-section">
+      <div class="card-section-head">
+        <h2>Rangos de feriados</h2>
+        <span class="h2-sub">Cierres completos de la barbería por rango de fechas</span>
+      </div>
+
+      {overrides.holiday_ranges.length === 0 ? (
+        <div class="empty-state" style="margin-bottom:16px;">
+          <p>No hay rangos de feriados configurados.</p>
+        </div>
+      ) : (
+        <table class="grid" style="margin-bottom:16px;">
+          <thead>
+            <tr>
+              <th>Inicio</th>
+              <th>Fin</th>
+              <th>Motivo</th>
+              <th class="actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {overrides.holiday_ranges.map((hr, i) => (
+              <tr>
+                <td>{hr.start}</td>
+                <td>{hr.end}</td>
+                <td>{hr.reason ?? <span class="muted-2">—</span>}</td>
+                <td class="actions">
+                  <form method="post" action={url} style="display:inline;">
+                    <input type="hidden" name="_action" value="delete_holiday" />
+                    <input type="hidden" name="holiday_index" value={i} />
+                    <button type="submit" class="btn small danger"
+                      onclick="return confirm('¿Eliminar este rango de feriado?');">Eliminar</button>
+                  </form>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <form method="post" action={url} class="form" style="max-width:500px;">
+        <input type="hidden" name="_action" value="add_holiday" />
+        <div class="form-grid-2">
+          <label>
+            Fecha de inicio
+            <input type="date" name="holiday_start" required />
+          </label>
+          <label>
+            Fecha de fin
+            <input type="date" name="holiday_end" required />
+          </label>
+        </div>
+        <label>
+          Motivo (opcional)
+          <input type="text" name="holiday_reason" placeholder="ej. Feriados de fin de año" maxlength="120" />
+        </label>
+        <div class="form-footer">
+          <button type="submit" class="btn primary small">Agregar rango de feriado</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- ── Barber Overrides ─────────────────────────────────────────── -->
+    <div class="card-section">
+      <div class="card-section-head">
+        <h2>Excepciones de barbero</h2>
+        <span class="h2-sub">Deshabilitar temporalmente un barbero por un rango de fechas</span>
+      </div>
+
+      {overrides.barber_overrides.length > 0 && (
+        <table class="grid" style="margin-bottom:16px;">
+          <thead>
+            <tr>
+              <th>Barbero</th>
+              <th>Desde</th>
+              <th>Hasta</th>
+              <th>Deshabilitado</th>
+              <th>Motivo</th>
+              <th class="actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {overrides.barber_overrides.map((bo) => {
+              const barber = barbers.find(b => b.id === bo.barber_id);
+              return (
+                <tr>
+                  <td>{barber?.name ?? <span class="muted-2">{bo.barber_id.slice(0,8)}</span>}</td>
+                  <td>{bo.date_from ?? <span class="muted-2">—</span>}</td>
+                  <td>{bo.date_to ?? <span class="muted-2">—</span>}</td>
+                  <td>
+                    {bo.is_disabled
+                      ? <span class="status status-suspended">no</span>
+                      : <span class="status status-active">sí</span>}
+                  </td>
+                  <td>{bo.reason ?? <span class="muted-2">—</span>}</td>
+                  <td class="actions">
+                    <form method="post" action={url} style="display:inline;">
+                      <input type="hidden" name="_action" value="remove_barber_override" />
+                      <input type="hidden" name="barber_id" value={bo.barber_id} />
+                      <button type="submit" class="btn small danger"
+                        onclick="return confirm('¿Eliminar esta excepción de barbero?');">Eliminar</button>
+                    </form>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      {barbers.length === 0 ? (
+        <p class="muted-2">Aún no hay barberos configurados. Agrega barberos antes de crear excepciones.</p>
+      ) : (
+        <form method="post" action={url} class="form" style="max-width:500px;">
+          <input type="hidden" name="_action" value="update_barber_override" />
+          <label>
+            Barbero
+            <select name="barber_id" required>
+              <option value="">— Seleccionar barbero —</option>
+              {barbers.map(b => (
+                <option value={b.id}>{b.name}{!b.is_active ? " (inactivo)" : ""}</option>
+              ))}
+            </select>
+          </label>
+          <div class="form-grid-2">
+            <label>
+              Fecha desde (opcional)
+              <input type="date" name="date_from" />
+            </label>
+            <label>
+              Fecha hasta (opcional)
+              <input type="date" name="date_to" />
+            </label>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" name="is_disabled" checked />
+            Deshabilitado (no disponible para reservas)
+          </label>
+          <label>
+            Motivo (opcional)
+            <input type="text" name="override_reason" placeholder="ej. Vacaciones, capacitación" maxlength="120" />
+          </label>
+          <div class="form-footer">
+            <button type="submit" class="btn primary small">Establecer excepción</button>
+          </div>
+        </form>
+      )}
+    </div>
+
+    <!-- ── Closed Dates ─────────────────────────────────────────────── -->
+    <div class="card-section">
+      <div class="card-section-head">
+        <h2>Fechas cerradas</h2>
+        <span class="h2-sub">Días individuales donde la recepción de reservas está bloqueada</span>
+      </div>
+      <p class="field-help" style="margin-bottom:12px;">
+        Las fechas cerradas son días individuales (YYYY-MM-DD) en los que no se pueden reservar turnos.
+        Para cierres de varios días, usa <strong>Rangos de feriados</strong> arriba.
+        Gestiona las fechas cerradas desde la <a href="/tenant/settings">página principal de configuración</a>.
+      </p>
+      {overrides.closed_dates.length === 0 ? (
+        <p class="muted-2">No hay fechas cerradas configuradas.</p>
+      ) : (
+        <div style="display:flex; flex-wrap:wrap; gap:6px;">
+          {overrides.closed_dates.map(d => (
+            <span class="status status-suspended">{d}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  </section>
+</TenantBase>

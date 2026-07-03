@@ -1,0 +1,252 @@
+---
+import TenantBase from "../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+interface Service {
+  id: string;
+  name: string;
+  code: string;
+  duration_minutes: number;
+  price_cents: number;
+  is_active: boolean;
+}
+
+function parsePriceInputToCents(raw: string): number | null {
+  const normalized = raw.trim();
+  if (!normalized) return null;
+  const withoutThousands = normalized.replace(/\./g, "").replace(/\s/g, "");
+  const decimalNormalized = withoutThousands.replace(",", ".");
+  const amount = Number(decimalNormalized);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  return Math.round(amount * 100);
+}
+
+let services: Service[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+const url = Astro.url.pathname;
+
+// ── Handle POST: create | toggle ───────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  try {
+    if (action === "create") {
+      const name = String(form.get("name") ?? "").trim();
+      const code = String(form.get("code") ?? "").trim() || "OTHER";
+      const rawDuration = String(form.get("duration_minutes") ?? "").trim();
+      const durationMinutes = parseInt(rawDuration, 10);
+      const rawPrice = String(form.get("price") ?? "").trim();
+      const priceCents = parsePriceInputToCents(rawPrice);
+      const isActive = form.getAll("is_active").includes("true");
+
+      if (!name) {
+        error = "El nombre es obligatorio.";
+      } else if (!rawDuration || isNaN(durationMinutes) || durationMinutes < 15) {
+        error = "La duración debe ser al menos 15 minutos.";
+      } else if (!rawPrice || priceCents === null) {
+        error = "El precio debe ser un importe válido, por ejemplo 17.000.";
+      } else {
+        await apiFetch(`/tenants/${principal.tenant_id}/services`, {
+          method: "POST",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name,
+            code,
+            duration_minutes: durationMinutes,
+            price_cents: priceCents,
+            is_active: isActive,
+          }),
+        });
+        flash = `Servicio "${name}" creado.`;
+      }
+    } else if (action === "toggle") {
+      const serviceId = String(form.get("service_id") ?? "");
+      const currentActive = form.get("is_active") === "true";
+      const serviceName = String(form.get("service_name") ?? "");
+
+      await apiFetch(`/tenants/${principal.tenant_id}/services/${serviceId}`, {
+        method: "PUT",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ is_active: !currentActive }),
+      });
+      flash = currentActive
+        ? `Servicio "${serviceName}" desactivado.`
+        : `Servicio "${serviceName}" activado.`;
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail =
+        (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+// ── Fetch services (always, to reflect current state) ──────────────────
+try {
+  services = await apiJson<Service[]>(
+    `/tenants/${principal.tenant_id}/services`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar los servicios (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+
+function formatPrice(cents: number): string {
+  return new Intl.NumberFormat("es-AR", {
+    style: "currency",
+    currency: "ARS",
+    maximumFractionDigits: 0,
+  }).format(cents / 100);
+}
+---
+
+<TenantBase title="Servicios — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Servicios</span>
+        <h1>Servicios</h1>
+        <p class="card-subtitle">
+          Gestiona tu catálogo de servicios — crea, edita y activa/desactiva disponibilidad.
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <!-- ── Inline create form ─────────────────────────────────────── -->
+    <form method="post" action={url} class="form">
+      <input type="hidden" name="_action" value="create" />
+      <div class="form-grid-2">
+        <label>
+          Nombre
+          <input
+            type="text"
+            name="name"
+            required
+            maxlength="120"
+            placeholder="ej. Corte"
+          />
+        </label>
+        <label>
+          Código
+          <input
+            type="text"
+            name="code"
+            maxlength="8"
+            placeholder="ej. C, B, CB"
+          />
+        </label>
+        <label>
+          Duración (minutos)
+          <input
+            type="number"
+            name="duration_minutes"
+            required
+            min="15"
+            max="480"
+            placeholder="ej. 30"
+          />
+        </label>
+      </div>
+      <div class="form-grid-2">
+        <label>
+          Precio
+          <input
+            type="text"
+            name="price"
+            required
+            inputmode="decimal"
+            placeholder="ej. 17.000"
+          />
+          <span class="field-help">Ingresalo en pesos. Ejemplo: 17.000</span>
+        </label>
+        <label class="checkbox" style="align-self:end; padding-bottom:12px;">
+          <input type="hidden" name="is_active" value="false" />
+          <input type="checkbox" name="is_active" value="true" checked />
+          Activo
+        </label>
+      </div>
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Agregar servicio</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── Services table ──────────────────────────────────────────── -->
+  <section class="card">
+    {services.length === 0 ? (
+      <div class="empty-state">
+        <p>Aún no hay servicios. Crea uno arriba.</p>
+      </div>
+    ) : (
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>Nombre</th>
+            <th>Código</th>
+            <th>Duración</th>
+            <th>Precio</th>
+            <th>Activo</th>
+            <th class="actions">Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {services.map((s) => (
+            <tr>
+              <td>
+                <strong>{s.name}</strong>
+              </td>
+              <td class="muted-2"><code>{s.code}</code></td>
+              <td>{s.duration_minutes} min</td>
+              <td>{formatPrice(s.price_cents)}</td>
+              <td>
+                {s.is_active
+                  ? <span class="status status-active">Activo</span>
+                  : <span class="status status-suspended">Inactivo</span>}
+              </td>
+              <td class="actions">
+                <a
+                  class="btn small"
+                  href={`/tenant/services/${s.id}/edit`}
+                >
+                  Editar
+                </a>
+                <form method="post" action={url} style="display:inline;">
+                  <input type="hidden" name="_action" value="toggle" />
+                  <input type="hidden" name="service_id" value={s.id} />
+                  <input type="hidden" name="service_name" value={s.name} />
+                  <input type="hidden" name="is_active" value={String(s.is_active)} />
+                  <button type="submit" class="btn small {s.is_active ? 'ghost' : 'primary'}">
+                    {s.is_active ? "Desactivar" : "Activar"}
+                  </button>
+                </form>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </section>
+</TenantBase>

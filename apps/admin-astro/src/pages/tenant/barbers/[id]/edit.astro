@@ -1,0 +1,143 @@
+---
+import TenantBase from "../../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+const { id } = Astro.params;
+if (!id) {
+  return new Response("Missing barber id", { status: 400 });
+}
+
+interface Barber {
+  id: string;
+  name: string;
+  restrictions: string | null;
+  is_active: boolean;
+}
+
+let barber: Barber | null = null;
+let error: string | null = null;
+let loadError: string | null = null;
+
+// ── Handle POST: update ────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  if (action === "update") {
+    const name = String(form.get("name") ?? "").trim();
+    const restrictions = String(form.get("restrictions") ?? "").trim() || null;
+    const isActive = form.get("is_active") === "true";
+
+    if (!name) {
+      error = "Name is required.";
+    } else {
+      try {
+        await apiFetch(`/tenants/${principal.tenant_id}/barbers/${id}`, {
+          method: "PUT",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name,
+            restrictions,
+            is_active: isActive,
+          }),
+        });
+        return Astro.redirect("/tenant/barbers/");
+      } catch (err: unknown) {
+        if (err instanceof ApiError) {
+          const detail =
+            (err.body as { detail?: string } | null | undefined)?.detail;
+          error = detail ?? `Update failed (${err.status}).`;
+        } else {
+          error = "Could not reach the API.";
+        }
+      }
+    }
+  }
+}
+
+// ── Fetch barber for display ───────────────────────────────────────────
+try {
+  barber = await apiJson<Barber>(
+    `/tenants/${principal.tenant_id}/barbers/${id}`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    return new Response("Barber not found", { status: 404 });
+  }
+  loadError = "Could not load barber.";
+}
+---
+
+<TenantBase title={barber ? `Edit ${barber.name} — Barber Agent` : "Edit barber"} email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Barbers</span>
+        <h1>{barber ? `Edit: ${barber.name}` : "Edit barber"}</h1>
+        <p class="card-subtitle">Update barber details and status.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/barbers/">Back to list</a>
+      </div>
+    </div>
+
+    {loadError && <p class="form-error">{loadError}</p>}
+    {error && <p class="form-error">{error}</p>}
+
+    {barber && (
+      <form method="post" action={Astro.url.pathname} class="form">
+        <input type="hidden" name="_action" value="update" />
+
+        <label>
+          Name
+          <input
+            type="text"
+            name="name"
+            value={barber.name}
+            required
+            maxlength="120"
+          />
+        </label>
+
+        <label>
+          Restrictions
+          <input
+            type="text"
+            name="restrictions"
+            value={barber.restrictions ?? ""}
+            maxlength="64"
+            placeholder="e.g. SOLO_CORTE"
+          />
+          <span class="field-help">Free-form tag for domain rules (optional).</span>
+        </label>
+
+        <label class="checkbox">
+          <input type="hidden" name="is_active" value="false" />
+          <input
+            type="checkbox"
+            name="is_active"
+            value="true"
+            checked={barber.is_active}
+          />
+          Active
+        </label>
+
+        <div class="form-footer">
+          <div class="card-actions">
+            <a class="btn small ghost" href="/tenant/barbers/">Cancel</a>
+            <button type="submit" class="btn primary">Save changes</button>
+          </div>
+        </div>
+      </form>
+    )}
+  </section>
+</TenantBase>

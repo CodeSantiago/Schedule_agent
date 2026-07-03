@@ -1,0 +1,204 @@
+---
+import TenantBase from "../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../lib/session";
+import { apiJson, ApiError } from "../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface OverviewCounts {
+  booked_today: number;
+  cancelled_today: number;
+  completed_today: number;
+  pending_today: number;
+  confirmed_today: number;
+  active_barbers: number;
+  active_services: number;
+  upcoming_days_with_bookings: number;
+}
+
+interface OverviewAppointment {
+  id: string;
+  barber_name: string;
+  service_name: string;
+  customer_name: string;
+  customer_phone: string;
+  start_time: string;
+  end_time: string;
+  status: string;
+  is_cb_continuation: boolean;
+}
+
+interface OverviewData {
+  tenant_id: string;
+  date: string;
+  counts: OverviewCounts;
+  appointments: OverviewAppointment[];
+  upcoming: Record<string, number>;
+}
+
+// ── State ───────────────────────────────────────────────────────────────────
+
+const today = new Date();
+const todayStr = today.toISOString().split("T")[0];
+let data: OverviewData | null = null;
+let loadError: string | null = null;
+
+try {
+  data = await apiJson<OverviewData>(
+    `/tenants/${principal.tenant_id}/overview?date=${todayStr}`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    loadError = `No se pudo cargar el panel (${err.status}).`;
+  } else {
+    loadError = "No se pudo contactar la API.";
+  }
+}
+
+const counts = data?.counts;
+const appointments = data?.appointments ?? [];
+const dashboardAppointments = appointments.slice(0, 6);
+const hiddenAppointmentsCount = Math.max(appointments.length - dashboardAppointments.length, 0);
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "Pendiente",
+    confirmed: "Confirmado",
+    completed: "Completado",
+    cancelled: "Cancelado",
+    no_show: "No asistió",
+  };
+  return labels[status] ?? status;
+}
+
+function fmtTime(raw: string): string {
+  // raw is "HH:MM:SS" or "HH:MM"  from the overview API
+  return raw.substring(0, 5);
+}
+---
+
+<TenantBase title="Panel — Barber Agent" email={principal.email}>
+  {loadError && <p class="form-error">{loadError}</p>}
+
+  <!-- ================================================================
+       KPI CARDS
+       ================================================================ -->
+  <section class="card tenant-dashboard-card tenant-dashboard-hero">
+    <div class="tenant-dashboard-hero-top">
+      <div>
+        <span class="card-eyebrow">Resumen</span>
+        <h1>Panel</h1>
+        <p class="card-subtitle">
+          Lo importante de hoy, sin mezclarlo con configuración ni tareas avanzadas.
+        </p>
+      </div>
+      <div class="tenant-dashboard-inline-nav">
+        <a class="btn" href="/tenant/appointments">Turnos</a>
+        <a class="btn" href="/tenant/barbers">Barberos</a>
+        <a class="btn" href="/tenant/services">Servicios</a>
+        <a class="btn" href="/tenant/settings">Configuración</a>
+      </div>
+    </div>
+
+    {counts && (
+      <>
+      <div class="cards tenant-dashboard-kpis">
+        <div class="kpi tenant-dashboard-kpi">
+          <div class="kpi-label">Turnos de hoy</div>
+          <div class="kpi-value">{counts.booked_today}</div>
+        </div>
+        <div class="kpi tenant-dashboard-kpi">
+          <div class="kpi-label">Pendientes</div>
+          <div class="kpi-value">{counts.pending_today}</div>
+        </div>
+        <div class="kpi tenant-dashboard-kpi">
+          <div class="kpi-label">Confirmados</div>
+          <div class="kpi-value">{counts.confirmed_today}</div>
+        </div>
+        <div class="kpi tenant-dashboard-kpi">
+          <div class="kpi-label">Completados</div>
+          <div class="kpi-value">{counts.completed_today}</div>
+        </div>
+      </div>
+      <div class="tenant-dashboard-facts">
+        <span>{counts.cancelled_today} cancelado{counts.cancelled_today !== 1 ? "s" : ""}</span>
+        <span>{counts.active_barbers} barbero{counts.active_barbers !== 1 ? "s" : ""} activo{counts.active_barbers !== 1 ? "s" : ""}</span>
+        <span>{counts.active_services} servicio{counts.active_services !== 1 ? "s" : ""} activo{counts.active_services !== 1 ? "s" : ""}</span>
+        <span>{counts.upcoming_days_with_bookings} d\u00eda{counts.upcoming_days_with_bookings !== 1 ? "s" : ""} con agenda futura</span>
+      </div>
+      </>
+    )}
+
+    <details class="tenant-secondary-nav">
+      <summary>Más opciones</summary>
+      <div class="tenant-secondary-actions">
+        <a class="btn ghost" href="/tenant/users">Equipo</a>
+        <a class="btn ghost" href="/tenant/settings/calendar-overrides">Calendario</a>
+        <a class="btn ghost" href="/tenant/settings/import">Importar</a>
+        <a class="btn ghost" href="/tenant/health">Centro de salud</a>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================================================================
+       TODAY'S AGENDA
+       ================================================================ -->
+  <section class="card tenant-dashboard-card tenant-dashboard-agenda">
+    <div class="card-header">
+      <div>
+        <h2>Agenda de hoy</h2>
+        <p class="card-subtitle">
+          Vista rápida para no salir del panel.
+        </p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href="/tenant/appointments/">Ver día completo</a>
+      </div>
+    </div>
+
+    {appointments.length === 0 ? (
+      <div class="empty-state">
+        <p>No hay turnos agendados para hoy.</p>
+      </div>
+    ) : (
+      <div class="tenant-dashboard-agenda-list">
+        {dashboardAppointments.map((a) => (
+          <article class="tenant-dashboard-appt">
+            <div class="tenant-dashboard-appt-time">
+              <strong>{fmtTime(a.start_time)}</strong>
+              <span>{fmtTime(a.end_time)}</span>
+            </div>
+            <div class="tenant-dashboard-appt-body">
+              <div class="tenant-dashboard-appt-top">
+                <strong>{a.customer_name}</strong>
+                <span class={`status status-${a.status}`}>
+                  {statusLabel(a.status)}
+                </span>
+              </div>
+              <p class="tenant-dashboard-appt-meta">
+                {a.barber_name} · {a.service_name}
+                {a.customer_phone ? ` · ${a.customer_phone}` : ""}
+                {a.is_cb_continuation ? " · cont. CB" : ""}
+              </p>
+            </div>
+          </article>
+        ))}
+      </div>
+    )}
+
+    {hiddenAppointmentsCount > 0 && (
+      <p class="tenant-dashboard-more muted">
+        {hiddenAppointmentsCount} turno{hiddenAppointmentsCount !== 1 ? "s" : ""} más en el día.
+        <a href={`/tenant/appointments/?date=${todayStr}`}> Ver agenda completa</a>
+      </p>
+    )}
+  </section>
+</TenantBase>

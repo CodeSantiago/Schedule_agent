@@ -1,0 +1,127 @@
+---
+import Base from "../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id } = Astro.params;
+if (!tenant_id) {
+  return new Response("Falta el identificador del negocio", { status: 400 });
+}
+
+interface TenantUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  is_active: boolean;
+}
+
+const VALID_ROLES = ["owner", "admin", "staff", "viewer"];
+
+let users: TenantUser[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const formData = await Astro.request.formData();
+  const action = String(formData.get("_action") ?? "");
+
+  try {
+    if (action === "create") {
+      const email = String(formData.get("email") ?? "").trim();
+      const password = String(formData.get("password") ?? "");
+      const name = String(formData.get("name") ?? "").trim();
+      const role = String(formData.get("role") ?? "staff");
+      await apiFetch(`/superadmin/tenants/${tenant_id}/users`, {
+        method: "POST",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password, name, role }),
+      });
+      flash = "Usuario creado.";
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  users = await apiJson<TenantUser[]>(
+    `/superadmin/tenants/${tenant_id}/users`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar los usuarios (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+---
+
+<Base title="Gestión de usuarios — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Administración</span>
+        <h1>Gestión de usuarios</h1>
+        <p class="card-subtitle">Administrá los usuarios de este negocio.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href={`/admin/tenants/${tenant_id}/settings`}>Volver</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <table class="grid">
+      <thead>
+        <tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Activo</th></tr>
+      </thead>
+      <tbody>
+        {users.map(u => (
+          <tr>
+            <td>{u.name}</td>
+            <td><code>{u.email}</code></td>
+            <td><span class={`status ${u.role === "owner" ? "status-active" : "status-trial"}`}>{u.role}</span></td>
+            <td>{u.is_active ? <span class="status status-active">activo</span> : <span class="status status-churned">inactivo</span>}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Administración</span>
+        <h2>Crear usuario</h2>
+      </div>
+    </div>
+    <form method="post" class="form" style="max-width:400px;">
+      <input type="hidden" name="_action" value="create" />
+      <label>Nombre <input type="text" name="name" required /></label>
+      <label>Correo electrónico <input type="email" name="email" required /></label>
+      <label>Contraseña <input type="password" name="password" required /></label>
+      <label>Rol
+        <select name="role">
+          {VALID_ROLES.filter(r => r !== "owner").map(r => (<option value={r}>{r}</option>))}
+        </select>
+      </label>
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Crear</button>
+      </div>
+    </form>
+  </section>
+</Base>

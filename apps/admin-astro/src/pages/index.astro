@@ -1,0 +1,9 @@
+---
+import { getPrincipal } from "../lib/session";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal !== null) {
+  return Astro.redirect("/admin");
+}
+return Astro.redirect("/login");
+---

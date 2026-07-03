@@ -1,0 +1,320 @@
+/* ======================================================================
+   Barber workspace — mobile-first, card-based layout.
+   Targets phone viewports primarily; scales gracefully to tablet.
+   ====================================================================== */
+
+/* ── Root overrides for workspace context ───────────────────────────── */
+
+body[data-context="workspace"] {
+  --surface-1: #0e1015;
+  --surface-2: #14181f;
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+
+.workspace-page {
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 12px 12px 80px;
+}
+
+.workspace-avatar-wrap {
+  display: flex;
+  justify-content: center;
+  padding-top: 10px;
+}
+
+.workspace-avatar {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 999px;
+  border: 2px solid var(--border);
+  box-shadow: var(--shadow-1);
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────── */
+
+.ws-card {
+  background: var(--surface-1);
+  border: none;
+  border-radius: var(--radius);
+  padding: 14px 14px 16px;
+  box-shadow: var(--shadow-1);
+  margin-bottom: 10px;
+}
+
+.ws-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.ws-eyebrow {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted-2);
+  margin-bottom: 2px;
+}
+
+.ws-header h1 {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.ws-subtitle {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* ── Barber Selector ────────────────────────────────────────────────── */
+
+.ws-selector-form {
+  margin-top: 4px;
+}
+
+.ws-selector-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ws-select {
+  width: 100%;
+  background: var(--surface-3);
+  color: var(--fg-strong);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238a93a3' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+  cursor: pointer;
+}
+
+.ws-select:focus {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+/* ── KPI Row ────────────────────────────────────────────────────────── */
+
+.ws-kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.ws-kpi {
+  background: var(--surface-2);
+  border: none;
+  border-radius: var(--radius);
+  padding: 10px 8px;
+  text-align: center;
+}
+
+.ws-kpi-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--fg-strong);
+  line-height: 1.2;
+}
+
+.ws-kpi-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.ws-kpi-pending { color: var(--warn-fg); }
+.ws-kpi-confirmed { color: var(--info-fg); }
+.ws-kpi-completed { color: var(--success-fg); }
+
+/* ── Card head ──────────────────────────────────────────────────────── */
+
+.ws-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.ws-card-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ws-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ── Appointment List ───────────────────────────────────────────────── */
+
+.ws-appt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ws-appt {
+  display: flex;
+  gap: 10px;
+  background: var(--surface-2);
+  border: none;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.ws-appt-time {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 52px;
+  padding-top: 2px;
+}
+
+.ws-appt-time-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg-strong);
+  line-height: 1.2;
+}
+
+.ws-appt-duration {
+  font-size: 10px;
+  color: var(--muted-2);
+  margin-top: 2px;
+}
+
+.ws-appt-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-appt-customer {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ws-appt-customer strong {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.ws-appt-phone {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ws-appt-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.ws-appt-service {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ws-appt-notes {
+  font-size: 11px;
+  color: var(--muted-2);
+  margin: 4px 0 0;
+  padding: 4px 6px;
+  background: var(--surface-3);
+  border-radius: var(--radius-sm);
+}
+
+.ws-appt .status {
+  height: 20px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────── */
+
+.ws-empty-state {
+  text-align: center;
+  padding: 20px 0;
+  color: var(--muted);
+}
+
+.ws-empty-state p {
+  margin: 0 0 4px;
+}
+
+.ws-empty-hint {
+  font-size: 13px;
+  color: var(--muted-2);
+}
+
+.ws-empty {
+  text-align: center;
+  color: var(--muted-2);
+  font-size: 13px;
+  padding: 12px 0;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+
+.ws-footer-card {
+  margin-top: 16px;
+}
+
+.ws-footer-links {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.ws-profile-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.ws-profile-field {
+  display: grid;
+  gap: 4px;
+}
+
+.ws-profile-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ws-profile-value {
+  font-size: 14px;
+  color: var(--fg-strong);
+}

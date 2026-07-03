@@ -1,0 +1,228 @@
+---
+import TenantBase from "../../../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+const { id } = Astro.params;
+if (!id) {
+  return new Response("Missing service id", { status: 400 });
+}
+
+interface Service {
+  id: string;
+  name: string;
+  code: string;
+  duration_minutes: number;
+  price_cents: number;
+  is_active: boolean;
+}
+
+function parsePriceInputToCents(raw: string): number | null {
+  const normalized = raw.trim();
+  if (!normalized) return null;
+  const withoutThousands = normalized.replace(/\./g, "").replace(/\s/g, "");
+  const decimalNormalized = withoutThousands.replace(",", ".");
+  const amount = Number(decimalNormalized);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  return Math.round(amount * 100);
+}
+
+function formatPriceInput(cents: number): string {
+  return new Intl.NumberFormat("es-AR", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+  }).format(cents / 100);
+}
+
+let service: Service | null = null;
+let error: string | null = null;
+let loadError: string | null = null;
+let flash: string | null = null;
+
+// ── Handle POST: update ────────────────────────────────────────────────
+if (Astro.request.method === "POST") {
+  const form = await Astro.request.formData();
+  const action = String(form.get("_action") ?? "");
+
+  if (action === "delete") {
+    try {
+      await apiFetch(`/tenants/${principal.tenant_id}/services/${id}`, {
+        method: "DELETE",
+        request: Astro.request,
+      });
+      return Astro.redirect("/tenant/services/");
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        const detail =
+          (err.body as { detail?: string } | null | undefined)?.detail;
+        error = detail === "service is in use by existing appointments and cannot be deleted"
+          ? "No se puede eliminar este servicio porque tiene turnos asociados. Desactivalo en su lugar."
+          : detail ?? `Error al eliminar (${err.status}).`;
+      } else {
+        error = "No se pudo contactar la API.";
+      }
+    }
+  } else if (action === "update") {
+    const name = String(form.get("name") ?? "").trim();
+    const rawDuration = String(form.get("duration_minutes") ?? "").trim();
+    const durationMinutes = parseInt(rawDuration, 10);
+    const rawPrice = String(form.get("price") ?? "").trim();
+    const priceCents = parsePriceInputToCents(rawPrice);
+    const code = String(form.get("code") ?? "").trim() || "OTHER";
+    const isActive = form.getAll("is_active").includes("true");
+
+    if (!name) {
+      error = "El nombre es obligatorio.";
+    } else if (!rawDuration || isNaN(durationMinutes) || durationMinutes < 15) {
+      error = "La duración debe ser al menos 15 minutos.";
+    } else if (!rawPrice || priceCents === null) {
+      error = "El precio debe ser un importe válido, por ejemplo 17.000.";
+    } else {
+      try {
+        await apiFetch(`/tenants/${principal.tenant_id}/services/${id}`, {
+          method: "PUT",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name,
+            code,
+            duration_minutes: durationMinutes,
+            price_cents: priceCents,
+            is_active: isActive,
+          }),
+        });
+        return Astro.redirect("/tenant/services/");
+      } catch (err: unknown) {
+        if (err instanceof ApiError) {
+          const detail =
+            (err.body as { detail?: string } | null | undefined)?.detail;
+          error = detail ?? `Error al actualizar (${err.status}).`;
+        } else {
+          error = "No se pudo contactar la API.";
+        }
+      }
+    }
+  }
+}
+
+// ── Fetch service for display ──────────────────────────────────────────
+try {
+  service = await apiJson<Service>(
+    `/tenants/${principal.tenant_id}/services/${id}`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    return new Response("Service not found", { status: 404 });
+  }
+  loadError = "No se pudo cargar el servicio.";
+}
+---
+
+<TenantBase title={service ? `Editar ${service.name} — Barber Agent` : "Editar servicio"} email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Servicios</span>
+        <h1>{service ? `Editar: ${service.name}` : "Editar servicio"}</h1>
+        <p class="card-subtitle">Actualiza los detalles y precios del servicio.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/services/">Volver a la lista</a>
+      </div>
+    </div>
+
+    {loadError && <p class="form-error">{loadError}</p>}
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    {service && (
+      <form method="post" action={Astro.url.pathname} class="form">
+        <input type="hidden" name="_action" value="update" />
+
+        <div class="form-grid-2">
+          <label>
+            Nombre
+            <input
+              type="text"
+              name="name"
+              value={service.name}
+              required
+              maxlength="120"
+            />
+          </label>
+          <label>
+            Código
+            <input
+              type="text"
+              name="code"
+              value={service.code}
+              maxlength="8"
+              placeholder="ej. C, B, CB"
+            />
+            <span class="field-help">Código corto para reglas de dominio (ej. C, B, CB).</span>
+          </label>
+        </div>
+
+        <div class="form-grid-2">
+          <label>
+            Duración (minutos)
+            <input
+              type="number"
+              name="duration_minutes"
+              value={service.duration_minutes}
+              required
+              min="15"
+              max="480"
+            />
+          </label>
+          <label>
+            Precio
+            <input
+              type="text"
+              name="price"
+              value={formatPriceInput(service.price_cents)}
+              inputmode="decimal"
+              placeholder="ej. 17.000"
+            />
+            <span class="field-help">Ingresalo en pesos. Ejemplo: 17.000</span>
+          </label>
+        </div>
+
+        <label class="checkbox">
+          <input type="hidden" name="is_active" value="false" />
+          <input
+            type="checkbox"
+            name="is_active"
+            value="true"
+            checked={service.is_active}
+          />
+          Activo
+        </label>
+
+        <div class="form-footer">
+          <div class="card-actions">
+            <a class="btn small ghost" href="/tenant/services/">Cancelar</a>
+            <button type="submit" class="btn primary">Guardar cambios</button>
+          </div>
+        </div>
+      </form>
+
+      <form
+        method="post"
+        action={Astro.url.pathname}
+        style="margin-top:16px;"
+        onsubmit="return confirm('¿Eliminar este servicio? Si ya tiene turnos asociados, la eliminación será rechazada.');"
+      >
+        <input type="hidden" name="_action" value="delete" />
+        <button type="submit" class="btn danger">Eliminar servicio</button>
+      </form>
+    )}
+  </section>
+</TenantBase>

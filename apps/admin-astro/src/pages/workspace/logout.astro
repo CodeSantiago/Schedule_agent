@@ -1,0 +1,6 @@
+---
+import { clearTenantSessionCookie } from "../../lib/session";
+
+clearTenantSessionCookie(Astro.cookies);
+return Astro.redirect("/workspace/login");
+---

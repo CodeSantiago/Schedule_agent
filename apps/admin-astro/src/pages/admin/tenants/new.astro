@@ -1,0 +1,95 @@
+---
+import Base from "../../../layouts/Base.astro";
+import { getPrincipal } from "../../../lib/session";
+import { apiFetch, ApiError } from "../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+let form = { name: "", slug: "", timezone: "UTC", status: "trial" };
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const data = await Astro.request.formData();
+  form = {
+    name: String(data.get("name") ?? "").trim(),
+    slug: String(data.get("slug") ?? "").trim().toLowerCase(),
+    timezone: String(data.get("timezone") ?? "UTC").trim() || "UTC",
+    status: String(data.get("status") ?? "trial").trim() || "trial",
+  };
+
+  if (!form.name) {
+    error = "El nombre es obligatorio.";
+  } else if (!form.slug) {
+    error = "El slug es obligatorio.";
+  } else {
+    try {
+      const res = await apiFetch("/superadmin/tenants", {
+        method: "POST",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: form.name,
+          slug: form.slug,
+          timezone: form.timezone,
+          status: form.status,
+        }),
+      });
+      const body = (await res.json()) as { id: string };
+      return Astro.redirect(`/admin/tenants/${body.id}/settings`);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+        error = detail ?? `No se pudo crear el negocio (${err.status}).`;
+      } else {
+        error = "No se pudo contactar la API.";
+      }
+    }
+  }
+}
+
+const STATUS_CHOICES = ["trial", "active", "suspended", "churned"];
+---
+
+<Base title="Nuevo negocio — Barber Agent" email={principal.email}>
+  <section class="card narrow">
+    <span class="card-eyebrow">Panel de control</span>
+    <h1>Nuevo negocio</h1>
+    <p class="card-subtitle">
+      Crea una nueva cuenta de negocio. El slug es el prefijo público de la URL
+      (<code>/&lt;slug&gt;/</code>) y debe ser único.
+    </p>
+    {error && <p class="form-error">{error}</p>}
+    <form method="post" class="form" action="/admin/tenants/new">
+      <label>Nombre
+        <input type="text" name="name" value={form.name} required maxlength="120" />
+      </label>
+      <label>Slug
+        <input
+          type="text"
+          name="slug"
+          value={form.slug}
+          required
+          maxlength="64"
+          pattern="[a-z0-9][a-z0-9-]*"
+        />
+      </label>
+      <label>Zona horaria
+        <input type="text" name="timezone" value={form.timezone} required maxlength="64" />
+      </label>
+      <label>Estado
+        <select name="status">
+          {STATUS_CHOICES.map((s) => (
+            <option value={s} selected={form.status === s}>{s}</option>
+          ))}
+        </select>
+      </label>
+      <div class="form-footer">
+        <a class="btn small ghost" href="/admin">Cancelar</a>
+        <button type="submit" class="btn primary">Crear negocio</button>
+      </div>
+    </form>
+  </section>
+</Base>

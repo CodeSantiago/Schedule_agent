@@ -1,0 +1,240 @@
+---
+import TenantBase from "../../layouts/TenantBase.astro";
+import { getTenantPrincipal } from "../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../lib/api";
+
+const principal = await getTenantPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/tenant/login");
+}
+
+interface TenantUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  is_active: boolean;
+  barber_id?: string | null;
+  barber_name?: string | null;
+}
+
+interface BarberOption {
+  id: string;
+  name: string;
+  is_active: boolean;
+}
+
+const VALID_ROLES = ["barber", "staff"];
+
+let users: TenantUser[] = [];
+let barbers: BarberOption[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+let formEmail = "";
+let formName = "";
+let formRole = "barber";
+let formBarberId = "";
+
+if (Astro.request.method === "POST") {
+  const formData = await Astro.request.formData();
+  const action = String(formData.get("_action") ?? "");
+
+  try {
+    if (action === "create") {
+      const email = String(formData.get("email") ?? "").trim();
+      const password = String(formData.get("password") ?? "");
+      const name = String(formData.get("name") ?? "").trim();
+      const role = String(formData.get("role") ?? "staff");
+      const barberId = String(formData.get("barber_id") ?? "").trim();
+      formEmail = email;
+      formName = name;
+      formRole = role;
+      formBarberId = barberId;
+
+      if (!email || !password || !name) {
+        error = "El correo, la contraseña y el nombre son obligatorios.";
+      } else {
+        await apiFetch(`/tenants/${principal.tenant_id}/users`, {
+          method: "POST",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email, password, name, role, barber_id: barberId || null }),
+        });
+        flash = `Acceso '${email}' creado.`;
+        formEmail = "";
+        formName = "";
+        formRole = "barber";
+        formBarberId = "";
+      }
+    } else if (action === "update") {
+      const userId = String(formData.get("user_id") ?? "");
+      const role = String(formData.get("role") ?? "");
+      const barberId = String(formData.get("barber_id") ?? "").trim();
+      const isActive = String(formData.get("is_active") ?? "") === "on";
+      await apiFetch(`/tenants/${principal.tenant_id}/users/${userId}`, {
+        method: "PATCH",
+        request: Astro.request,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role, is_active: isActive, barber_id: barberId || null }),
+      });
+      flash = "Usuario actualizado.";
+    }
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail === "you cannot change your own role from this screen"
+        ? "No podés cambiar tu propio rol desde esta pantalla."
+        : detail ?? `Operación fallida (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  barbers = await apiJson<BarberOption[]>(
+    `/tenants/${principal.tenant_id}/barbers`,
+    { request: Astro.request },
+  );
+  users = await apiJson<TenantUser[]>(
+    `/tenants/${principal.tenant_id}/users`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar los usuarios (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+---
+
+<TenantBase title="Usuarios — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Equipo</span>
+        <h1>Miembros del equipo</h1>
+        <p class="card-subtitle">Crea accesos simples para tus barberos y tu staff.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small ghost" href="/tenant/dashboard">Volver a inicio</a>
+        <a class="btn small" href="/tenant/settings">Configuración</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    <!-- Existing users -->
+    <table class="grid">
+      <thead>
+        <tr>
+          <th>Nombre</th>
+          <th>Correo</th>
+          <th>Rol</th>
+          <th>Barbero vinculado</th>
+          <th>Activo</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {users.map(u => (
+          <tr>
+            <td>{u.name}</td>
+            <td><code>{u.email}</code></td>
+              <td>
+                <span class={`status ${u.role === "owner" ? "status-active" : u.role === "admin" ? "status-trial" : u.role === "staff" ? "status-pending" : "status-suspended"}`}>
+                  {u.role}
+                </span>
+              </td>
+              <td>{u.barber_name ?? "—"}</td>
+              <td>
+                {u.is_active
+                  ? <span class="status status-active">activo</span>
+                : <span class="status status-churned">inactivo</span>}
+            </td>
+            <td class="actions team-actions-cell">
+              {u.role !== "owner" && u.id !== principal.principal_id && (
+                <form method="post" class="team-user-form">
+                  <input type="hidden" name="_action" value="update" />
+                  <input type="hidden" name="user_id" value={u.id} />
+                  <select name="role" class="team-inline-select">
+                    {VALID_ROLES.map(r => (
+                      <option value={r} selected={u.role === r}>{r === "barber" ? "barbero" : "staff"}</option>
+                    ))}
+                  </select>
+                  <select name="barber_id" class="team-inline-select">
+                    <option value="">sin vincular</option>
+                    {barbers.filter(b => b.is_active).map(b => (
+                      <option value={b.id} selected={u.barber_id === b.id}>{b.name}</option>
+                    ))}
+                  </select>
+                  <span class="team-inline-help">
+                    {u.role === "barber" ? "(obligatorio para barber)" : ""}
+                  </span>
+                  <label class="team-inline-check">
+                    <input type="checkbox" name="is_active" checked={u.is_active} />
+                    activo
+                  </label>
+                  <button type="submit" class="btn small">Actualizar</button>
+                </form>
+              )}
+              {u.id === principal.principal_id && (
+                <span style="font-size:11px; color:var(--muted);">Tu propia cuenta no cambia de rol desde acá.</span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Create user -->
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Equipo</span>
+        <h2>Crear acceso</h2>
+        <p class="card-subtitle">Lo normal es crear una cuenta por barbero, vincularla y darle esas credenciales.</p>
+      </div>
+    </div>
+
+    <form method="post" class="form" style="max-width:400px;">
+      <input type="hidden" name="_action" value="create" />
+      <label>
+        Nombre
+        <input type="text" name="name" value={formName} required maxlength="120" />
+      </label>
+      <label>
+        Correo electrónico
+        <input type="email" name="email" value={formEmail} required maxlength="255" />
+      </label>
+      <label>
+        Contraseña
+        <input type="password" name="password" required />
+      </label>
+      <label>
+        Tipo de cuenta
+        <select name="role">
+          {VALID_ROLES.map(r => (
+            <option value={r} selected={formRole === r}>{r === "barber" ? "Barbero (entra a su agenda)" : "Staff (recepción o apoyo)"}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Barbero vinculado
+        <select name="barber_id">
+          <option value="">Sin vincular</option>
+          {barbers.filter(b => b.is_active).map(b => (
+            <option value={b.id} selected={formBarberId === b.id}>{b.name}</option>
+          ))}
+        </select>
+      </label>
+      <p class="field-help">Si la cuenta es para un barbero, elegí <strong>Barbero</strong> y vinculalo acá. Si no, usá <strong>Staff</strong>. Para un barbero, el vínculo es obligatorio.</p>
+      <div class="form-footer">
+        <button type="submit" class="btn primary">Crear acceso</button>
+      </div>
+    </form>
+  </section>
+</TenantBase>

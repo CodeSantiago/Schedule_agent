@@ -1,0 +1,49 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+dist/
+build/
+*.whl
+
+# ── Environment ─────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+
+# ── Database ────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*_backup*
+
+# ── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Cache / Temp ────────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+/tmp/
+
+# ── Astro / Node ───────────────────────────────────────────────────────────
+apps/admin-astro/node_modules/
+apps/admin-astro/dist/
+apps/admin-astro/.astro/
+node_modules/
+
+# ── SDD artifacts (track proposal files but ignore generated state) ─────────
+openspec/**/state.yaml
+
+# ── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

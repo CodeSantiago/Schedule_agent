@@ -1,0 +1,117 @@
+---
+import Base from "../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id } = Astro.params;
+if (!tenant_id) {
+  return new Response("Falta el identificador del negocio", { status: 400 });
+}
+
+interface Template {
+  id: string;
+  name: string;
+  description: string;
+  services: Array<{ name: string; code: string; duration_minutes: number; price_cents: number }>;
+  barbers: Array<{ name: string }>;
+  schedules: Array<{ barber_name: string; weekday: string; start_time: string; end_time: string }>;
+}
+
+let templates: Template[] = [];
+let flash: string | null = null;
+let error: string | null = null;
+
+if (Astro.request.method === "POST") {
+  const formData = await Astro.request.formData();
+  const templateId = String(formData.get("template_id") ?? "");
+
+  try {
+    await apiFetch(`/superadmin/templates/${templateId}/apply/${tenant_id}`, {
+      method: "POST",
+      request: Astro.request,
+    });
+    flash = "Plantilla aplicada correctamente.";
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+      error = detail ?? `No se pudo aplicar la plantilla (${err.status}).`;
+    } else {
+      error = "No se pudo contactar la API.";
+    }
+  }
+}
+
+try {
+  templates = await apiJson<Template[]>("/superadmin/templates", {
+    request: Astro.request,
+  });
+} catch (err: unknown) {
+  if (err instanceof ApiError) {
+    error = `No se pudieron cargar las plantillas (${err.status}).`;
+  } else {
+    error = "No se pudo contactar la API.";
+  }
+}
+---
+
+<Base title="Plantillas — Barber Agent" email={principal.email}>
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <span class="card-eyebrow">Onboarding</span>
+        <h1>Plantillas de onboarding</h1>
+        <p class="card-subtitle">Aplicá una plantilla predefinida para cargar servicios, barberos y configuración en este negocio.</p>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href={`/admin/tenants/${tenant_id}/settings`}>Volver a configuración</a>
+      </div>
+    </div>
+
+    {flash && <div class="flash">{flash}</div>}
+    {error && <p class="form-error">{error}</p>}
+
+    {templates.length === 0 ? (
+      <div class="empty-state"><p>No hay plantillas disponibles.</p></div>
+    ) : (
+      templates.map(t => (
+        <div class="card-section" style="border:1px solid var(--border-soft); border-radius:var(--radius); padding:16px; margin-bottom:12px;">
+          <div class="card-section-head">
+            <h2 style="margin:0;">{t.name}</h2>
+            <form method="post" style="margin:0;">
+              <input type="hidden" name="template_id" value={t.id} />
+              <button type="submit" class="btn primary small" onclick="return confirm('¿Aplicar esta plantilla? Solo agregará datos faltantes (barberos, servicios y horarios). Los datos existentes NO se sobrescriben.');">
+                Aplicar
+              </button>
+            </form>
+          </div>
+          <p class="muted" style="font-size:13px; margin-bottom:10px;">{t.description}</p>
+
+          {t.services.length > 0 && (
+            <div style="margin-top:8px;">
+              <strong style="font-size:12px; color:var(--muted);">Servicios:</strong>
+              <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;">
+                {t.services.map(s => (
+                  <span style="background:var(--surface-3); padding:2px 8px; border-radius:4px; font-size:12px;">
+                    {s.name} ({s.code}) — ${(s.price_cents / 100).toFixed(0)}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {t.barbers.length > 0 && (
+            <div style="margin-top:8px;">
+              <strong style="font-size:12px; color:var(--muted);">Barberos:</strong>
+              <span style="font-size:12px; margin-left:6px;">{t.barbers.map(b => b.name).join(", ")}</span>
+            </div>
+          )}
+        </div>
+      ))
+    )}
+  </section>
+</Base>

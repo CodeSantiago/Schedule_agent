@@ -1,0 +1,400 @@
+---
+import Base from "../../../../../../layouts/Base.astro";
+import { getPrincipal } from "../../../../../../lib/session";
+import { apiFetch, apiJson, ApiError } from "../../../../../../lib/api";
+
+const principal = await getPrincipal(Astro.cookies, Astro.request);
+if (principal === null) {
+  return Astro.redirect("/login");
+}
+
+const { tenant_id, config_id } = Astro.params;
+if (!tenant_id || !config_id) {
+  return new Response("Missing tenant or config id", { status: 400 });
+}
+
+const KIND_CHOICES = ["whatsapp", "llm", "calendar", "sheets", "sms"];
+
+interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+  timezone: string;
+}
+
+interface ProviderConfig {
+  id: string;
+  kind: string;
+  label: string;
+  provider_name: string;
+  credentials: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  is_active: boolean;
+}
+
+// ── Curated LLM model list ─────────────────────────────────────────────
+// OpenRouter model slugs. When OpenRouter dynamic listing is added later,
+// this hardcoded list can be replaced or extended.
+const LLM_MODEL_OPTIONS = [
+  { value: "openrouter/free", label: "OpenRouter Free Router" },
+  { value: "openai/gpt-oss-20b:free", label: "GPT OSS 20B (free)" },
+  { value: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B (free)" },
+  { value: "google/gemma-4-31b-it:free", label: "Gemma 4 31B (free)" },
+  { value: "qwen/qwen3-next-80b-a3b-instruct:free", label: "Qwen3 Next 80B (free)" },
+  { value: "meta-llama/llama-3.2-3b-instruct:free", label: "Llama 3.2 3B (free)" },
+];
+const LLM_DEFAULT_MODEL = LLM_MODEL_OPTIONS[0].value;
+
+// ── Kapso sandbox — minimal fields ──────────────────────────────────────
+// Only the fields needed for a Kapso sandbox setup. Advanced/production
+// fields are intentionally excluded from the UI but the JSONB storage
+// still accepts them via the API for later extension.
+const KAPSO_CREDENTIAL_FIELDS = [
+  { name: "api_key", label: "API key", type: "password" as const, credential_key: "api_key", placeholder: "Kapso API key", help: "Your Kapso API key for sandbox or production." },
+  { name: "webhook_secret", label: "Webhook secret", type: "password" as const, credential_key: "webhook_secret", placeholder: "Optional", help: "Shared secret for webhook signature verification (optional for sandbox)." },
+];
+const KAPSO_SETTINGS_FIELDS = [
+  { name: "phone_number_id", label: "Phone number ID", type: "text" as const, settings_key: "phone_number_id", placeholder: "e.g. 109283746152345", help: "Sender phone number ID from Kapso dashboard." },
+  { name: "base_url", label: "Base URL", type: "text" as const, settings_key: "base_url", placeholder: "https://graph.facebook.com/v22.0", help: "Kapso API base URL (use sandbox URL in sandbox mode)." },
+  { name: "sandbox", label: "Sandbox mode", type: "checkbox" as const, settings_key: "sandbox", help: "Enable Kapso sandbox for testing without sending real messages." },
+  { name: "display_phone_number", label: "Display phone (optional)", type: "text" as const, settings_key: "display_phone_number", placeholder: "+1234567890", help: "Phone number shown to customers (optional)." },
+];
+const KAPSO_FIELDS = [...KAPSO_CREDENTIAL_FIELDS, ...KAPSO_SETTINGS_FIELDS];
+// ── LLM simplified fields ──────────────────────────────────────────────
+// Only api_key and model are exposed. provider_name and label are
+// auto-filled server-side on POST. base_url is omitted (OpenRouter
+// handles routing; dynamic endpoint config is a future concern).
+const LLM_FIELDS = [
+  { name: "api_key", label: "API key", type: "password" as const, credential_key: "api_key", placeholder: "OpenRouter API key", help: "Your OpenRouter API key. The provider is always openrouter." },
+  { name: "model", label: "Model", type: "select" as const, settings_key: "model", options: LLM_MODEL_OPTIONS, help: "LLM routed through OpenRouter. More models available via API." },
+];
+type TypedField = {
+  name: string;
+  label: string;
+  type: "text" | "password" | "checkbox" | "select";
+  credential_key?: string;
+  settings_key?: string;
+  placeholder?: string;
+  help?: string;
+  options?: { value: string; label: string }[];
+};
+// The typed-schema lookup keyed by kind.
+// For kind=whatsapp we default to the Kapso sandbox fields for the
+// GET view.  On POST the handler checks provider_name and falls back
+// to raw JSON when the provider is NOT Kapso.
+const TYPED_SCHEMAS: Record<string, TypedField[]> = {
+  whatsapp: KAPSO_FIELDS,
+  llm: LLM_FIELDS,
+};
+
+let tenant: Tenant | null = null;
+let config: ProviderConfig | null = null;
+let form = {
+  label: "",
+  provider_name: "",
+  is_active: true,
+  credentials_json: "",
+  settings_json: "",
+  typed: {} as Record<string, string>,
+};
+let error: string | null = null;
+
+try {
+  tenant = await apiJson<Tenant>(`/superadmin/tenants/${tenant_id}`, {
+    request: Astro.request,
+  });
+  config = await apiJson<ProviderConfig>(
+    `/tenants/${tenant_id}/provider-configs/${config_id}`,
+    { request: Astro.request },
+  );
+} catch (err: unknown) {
+  if (err instanceof ApiError && err.status === 404) {
+    return new Response("Not found", { status: 404 });
+  }
+  error = "Could not load provider config.";
+}
+
+if (config) {
+  // Pre-fill the form with stored values.
+  const schema = TYPED_SCHEMAS[config.kind] ?? [];
+  for (const f of schema) {
+    const isCred = "credential_key" in f;
+    const key = isCred ? f.credential_key : f.settings_key;
+    if (!key) continue;
+    const raw = isCred ? config.credentials?.[key] : config.settings?.[key];
+    if (raw !== undefined && raw !== null) {
+      form.typed[f.name] = String(raw);
+    }
+  }
+  if (schema.length === 0) {
+    form.credentials_json = JSON.stringify(config.credentials ?? {}, null, 2);
+    form.settings_json = JSON.stringify(config.settings ?? {}, null, 2);
+  }
+  form.label = config.label;
+  form.provider_name = config.provider_name;
+  form.is_active = config.is_active;
+}
+
+if (Astro.request.method === "POST" && config && tenant) {
+  const data = await Astro.request.formData();
+  form = {
+    label: String(data.get("label") ?? "").trim(),
+    provider_name: String(data.get("provider_name") ?? "").trim(),
+    is_active: data.get("is_active") === "true",
+    credentials_json: String(data.get("credentials") ?? ""),
+    settings_json: String(data.get("settings") ?? ""),
+    typed: {},
+  };
+  // Determine the effective schema for this POST.
+  // For kind=whatsapp, if provider_name is NOT "kapso", fall back to raw
+  // JSON mode — clients that use a different WhatsApp provider shouldn't
+  // be forced into the Kapso sandbox fields.
+  const isWhatsappKapso = config.kind === "whatsapp" && form.provider_name.toLowerCase() === "kapso";
+  const useTyped = isWhatsappKapso || config.kind === "llm";
+  const schema = useTyped ? (TYPED_SCHEMAS[config.kind] ?? []) : [];
+  for (const f of schema) {
+    const v = String(data.get(f.name) ?? "").trim();
+    if (v) form.typed[f.name] = v;
+  }
+
+  // ── LLM auto-fill: hide provider_name and label from the user ─────────
+  if (config.kind === "llm") {
+    const modelValue = form.typed["model"] || (config.settings?.model as string) || LLM_DEFAULT_MODEL;
+    const modelOption = LLM_MODEL_OPTIONS.find((o) => o.value === modelValue);
+    form.provider_name = "openrouter";
+    form.label = `LLM: ${modelOption?.label ?? modelValue}`;
+  }
+
+  if (!form.label) {
+    error = "Label is required.";
+  } else if (!form.provider_name) {
+    error = "Provider name is required.";
+  } else {
+    let credentials: Record<string, unknown> | null = null;
+    let settings: Record<string, unknown> | null = null;
+
+    if (schema.length > 0) {
+      // Merge typed fields on top of existing — empty typed fields
+      // on edit keep the stored value.
+      credentials = { ...(config.credentials ?? {}) };
+      settings = { ...(config.settings ?? {}) };
+      for (const f of schema) {
+        const raw = form.typed[f.name];
+        if (raw === undefined || raw === null) continue;
+        // Checkboxes: when checked, set to true. When unchecked the
+        // hidden input sends "" — interpret as false.
+        if (f.type === "checkbox") {
+          if ("settings_key" in f && f.settings_key) {
+            settings[f.settings_key] = raw === "true";
+          }
+          continue;
+        }
+        if (raw === "") continue;
+        if ("credential_key" in f && f.credential_key) {
+          credentials[f.credential_key] = raw;
+        }
+        if ("settings_key" in f && f.settings_key) {
+          settings[f.settings_key] = raw;
+        }
+      }
+    } else {
+      // Raw JSON: empty textarea = no change.
+      if (form.credentials_json.trim()) {
+        try {
+          const parsed = JSON.parse(form.credentials_json);
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            error = "Credentials must be a JSON object.";
+          } else {
+            credentials = parsed;
+          }
+        } catch (e) {
+          error = `Credentials is not valid JSON: ${(e as Error).message}`;
+        }
+      }
+      if (!error && form.settings_json.trim()) {
+        try {
+          const parsed = JSON.parse(form.settings_json);
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            error = "Settings must be a JSON object.";
+          } else {
+            settings = parsed;
+          }
+        } catch (e) {
+          error = `Settings is not valid JSON: ${(e as Error).message}`;
+        }
+      }
+    }
+
+    if (!error) {
+      try {
+        await apiFetch(`/tenants/${tenant_id}/provider-configs/${config_id}`, {
+          method: "PATCH",
+          request: Astro.request,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            label: form.label,
+            provider_name: form.provider_name,
+            credentials,
+            settings,
+            is_active: form.is_active,
+          }),
+        });
+        return Astro.redirect(`/admin/tenants/${tenant_id}/settings`);
+      } catch (err: unknown) {
+        if (err instanceof ApiError) {
+          const detail = (err.body as { detail?: string } | null | undefined)?.detail;
+          error = detail ?? `Could not update provider config (${err.status}).`;
+        } else {
+          error = "Could not reach the API.";
+        }
+      }
+    }
+  }
+}
+
+const schema = TYPED_SCHEMAS[config?.kind ?? ""] ?? [];
+const isLlm = config?.kind === "llm";
+
+// Build model options for the select, including a fallback entry if the
+// stored model is not in the curated list (e.g. configs created before
+// this simplification or via the API).
+function modelOptionsFor(f: TypedField): { value: string; label: string }[] {
+  if (f.type !== "select" || !f.options) return [];
+  const stored = form.typed[f.name];
+  if (stored && !f.options.some((o) => o.value === stored)) {
+    return [{ value: stored, label: `Custom: ${stored}` }, ...f.options];
+  }
+  return f.options;
+}
+const formMode = schema.length > 0 ? "typed" : "raw";
+---
+
+<Base title={tenant ? `Edit provider config — ${tenant.name}` : "Edit provider config"} email={principal.email}>
+  <section class="card card-compact pcf">
+    <div class="card-header">
+      <div>
+        <h1>Edit provider config{tenant && config && (
+          <span class="muted" style="font-weight:400;font-size:13px;margin-left:8px;">
+            — {tenant.name} · <code>{config.kind}</code>
+          </span>
+        )}</h1>
+      </div>
+      <div class="card-actions">
+        <a class="btn small" href={`/admin/tenants/${tenant_id}/settings`}>Back</a>
+      </div>
+    </div>
+    {error && <p class="form-error">{error}</p>}
+    <form method="post" class="form" action={`/admin/tenants/${tenant_id}/provider-configs/${config_id}/edit`}>
+      <fieldset>
+        <legend>Identity</legend>
+        <div class="form-grid-2">
+          <label>Kind
+            <select name="kind" disabled required>
+              {KIND_CHOICES.map((k) => (
+                <option value={k} selected={config?.kind === k}>{k}</option>
+              ))}
+            </select>
+            <input type="hidden" name="kind" value={config?.kind ?? ""} />
+          </label>
+          <!-- provider_name is hidden for LLM — auto-filled on POST -->
+          {!isLlm && <label>Provider name
+            <input
+              type="text"
+              name="provider_name"
+              value={form.provider_name}
+              required
+              maxlength="64"
+              placeholder="e.g. kapso, groq"
+            />
+          </label>}
+        </div>
+        <!-- label is hidden for LLM — auto-derived from selected model -->
+        {!isLlm && <label>Label
+          <input
+            type="text"
+            name="label"
+            value={form.label}
+            required
+            maxlength="120"
+            placeholder="e.g. Kapso prod"
+          />
+        </label>}
+        {isLlm && (
+          <>
+            <input type="hidden" name="provider_name" value={form.provider_name} />
+            <input type="hidden" name="label" value={form.label} />
+          </>
+        )}
+      </fieldset>
+
+      {formMode === "typed" ? (
+        <fieldset>
+          <legend>{config?.kind} fields</legend>
+          <div class="pcf-fields">
+            {schema.map((f, i, arr) => (
+              f.type === "checkbox" ? (
+                <label class="checkbox-field">
+                  <input type="hidden" name={f.name} value="" />
+                  <input type="checkbox" name={f.name} value="true" checked={form.typed[f.name] === "true"} />
+                  {f.label}
+                  {f.help && <span class="field-help">{f.help}</span>}
+                </label>
+              ) : f.type === "select" ? (
+                <label class={arr.length % 2 === 1 && i === arr.length - 1 ? "full" : ""}>{f.label}
+                  <select name={f.name}>
+                    {modelOptionsFor(f).map((opt) => (
+                      <option value={opt.value} selected={form.typed[f.name] === opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                  {f.help && <span class="field-help">{f.help}</span>}
+                </label>
+              ) : (
+              <label class={arr.length % 2 === 1 && i === arr.length - 1 ? "full" : ""}>{f.label}
+                <input
+                  type={f.type}
+                  name={f.name}
+                  value={form.typed[f.name] ?? ""}
+                  placeholder={f.placeholder ?? ""}
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                {f.help && <span class="field-help">{f.help}</span>}
+              </label>
+              )
+            ))}
+          </div>
+        </fieldset>
+      ) : (
+        <fieldset>
+          <legend>Credentials &amp; settings</legend>
+          <div class="form-grid-2">
+            <label>Credentials (JSON)
+              <textarea name="credentials" rows="3" placeholder='{"api_key": "..."}'>{form.credentials_json}</textarea>
+            </label>
+            <label>Settings (JSON)
+              <textarea name="settings" rows="3" placeholder='{"webhook_url": "..."}'>{form.settings_json}</textarea>
+            </label>
+          </div>
+        </fieldset>
+      )}
+
+      <div class="pcf-activation">
+        <label class="checkbox">
+          <input type="checkbox" name="is_active" value="true" checked={form.is_active} />
+          Active
+        </label>
+        <span class="field-help pcf-activate-hint">
+          Activating deactivates other active rows of this <em>kind</em>.
+        </span>
+      </div>
+
+      <div class="form-footer">
+        <div class="card-actions">
+          <a class="btn small ghost" href={`/admin/tenants/${tenant_id}/settings`}>Cancel</a>
+          <button type="submit" class="btn primary">Save</button>
+        </div>
+      </div>
+    </form>
+  </section>
+</Base>

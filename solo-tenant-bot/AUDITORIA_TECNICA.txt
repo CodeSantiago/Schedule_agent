@@ -1,0 +1,579 @@
+================================================================
+AUDITORÍA TÉCNICA — whatsapp_bot (Capitán Barbería)
+Repo: /home/sayer/Proyectos/whatsapp_bot/
+Archivos auditados: api.py (2190 líneas), sheets.py (734 líneas)
+Stack: FastAPI + uvicorn + Groq + Google Sheets (gspread) + ManyChat
+Despliegue: Railway
+Síntomas reportados: no responde, responde duplicado, pierde estado,
+procesa dos veces el mismo mensaje.
+================================================================
+
+
+================================================================
+1. WEBHOOKS
+================================================================
+
+Cómo se reciben los requests
+----------------------------
+- Framework: FastAPI con uvicorn (api.py:6, 16, 2183-2189).
+- Endpoint principal: POST /message (api.py:2027).
+- Otros endpoints:
+    GET  /health
+    POST /disponibilidad/dias
+    POST /disponibilidad/horarios
+    POST /disponibilidad/barberos
+    POST /reset
+    POST /admin
+    POST /human-takeover
+    POST /human-release
+    GET  /debug/sesiones
+    GET  /bot-status
+- Auth: header Authorization: Bearer <API_SECRET_KEY> (opcional; si
+  no está seteado en env, queda abierto — api.py:124-127).
+- Modelo de entrada (api.py:97-100):
+      class MessageRequest(BaseModel):
+          user_id: str
+          message: str
+          user_name: Optional[str] = None
+  PROBLEMA: NO se recibe ni valida message_id ni event_id de
+  ManyChat. Esto es causa raíz probable del procesamiento duplicado.
+
+
+¿Responde lento?
+----------------
+SÍ. Y mucho. Cadena de bloqueo completa dentro de un solo async def:
+
+  POST /message (api.py:2028)
+   ├─ verificar_api_key
+   ├─ obtener_bot_activo(SPREADSHEET_ID)        ← Sheets call #1
+   ├─ DEBOUNCE: asyncio.sleep(2)                ← BLOQUEA 2s (api.py:2057)
+   ├─ procesar_mensaje()                        ← 100% síncrono (api.py:2069)
+   │   ├─ get_sesion (RAM)
+   │   ├─ 13 detectores (RAM, gratis)
+   │   ├─ si nada detectado → clasificar_con_llm() ← Groq sync
+   │   │                                      500-2000ms (api.py:640-648)
+   │   ├─ obtener_horarios_disponibles()
+   │   │   └─ obtener_disponibilidad()         ← Sheets get_all_values
+   │   │                                      (sheets.py:373)
+   │   ├─ si confirma → _intentar_guardar()
+   │   │   ├─ _verificar_horario() → otro
+   │   │   │   obtener_disponibilidad()        ← Sheets call #2
+   │   │   ├─ guardar_turno_en_sheets()        ← Sheets call #3
+   │   └─ logger
+   └─ return MessageResponse
+
+Estimación por request: 2s (debounce) + 500-2000ms (Groq) + 3× Sheets
+(1-3s cada una) = 4-8 segundos en el peor caso.
+
+
+Riesgo de timeout
+-----------------
+- Railway: corta a 30s por default (depende del plan; en plan hobby
+  puede ser menos).
+- ManyChat webhook: timeout por default 10-15s.
+- Groq free tier: rate limit 30 req/min, latencia variable.
+- El debounce de 2s (api.py:81) + latencia de Sheets/Groq superan los
+  5s con frecuencia → ManyChat reintenta el webhook (síntoma
+  "responde duplicado" o "no responde").
+
+
+¿ManyChat podría reenviar?
+--------------------------
+SÍ. Si el endpoint no responde en su ventana de timeout, ManyChat
+reintenta. Y como NO hay dedup por message_id, ambos requests se
+procesan completos (síntoma "procesa dos veces el mismo mensaje" —
+api.py:810-822 solo dedup por texto idéntico en 3s, no por message_id).
+
+
+¿El response HTTP se devuelve tarde?
+-------------------------------------
+SÍ. El handler hace TODO el trabajo antes de devolver la respuesta.
+No usa el patrón correcto:
+- ❌ Hacer: ack inmediato (200 OK) + procesar en background — eso
+  requiere worker (Redis, RQ, etc.).
+- ✅ Hacer MÍNIMO: devolver 200 OK rápido y mover la llamada a
+  Sheets/Groq a un BackgroundTasks de FastAPI (mínimo cambio, sin
+  infraestructura nueva).
+
+Detalle crítico en api.py:2057: await asyncio.sleep(_DEBOUNCE_SECONDS)
+con valor 2s. Este sleep bloquea la coroutine pero libera el event
+loop. Sin embargo, al estar dentro de un async def, el resto del
+handler (Groq, Sheets) corre también como coroutine. Como gspread NO
+es async (sheets.py:12), las llamadas bloquean el event loop de
+verdad.
+
+
+================================================================
+2. CONCURRENCIA
+================================================================
+
+Race conditions reales
+----------------------
+
+A) Doble procesamiento por debounce mal implementado (api.py:2049-2066)
+
+    if user_id not in _pending_messages:
+        _pending_messages[user_id] = {"texts": [], "latest_ts": 0}
+    _pending_messages[user_id]["texts"].append(req.message)
+    _pending_messages[user_id]["latest_ts"] = msg_ts
+    await asyncio.sleep(_DEBOUNCE_SECONDS)
+    if _pending_messages.get(user_id, {}).get("latest_ts") != msg_ts:
+        return MessageResponse(response="BOT_SILENCIADO", action=None)
+
+Si ManyChat manda el mismo user_id con dos requests casi simultáneos
+(caso típico: reintento por timeout), ambos leen el mismo latest_ts,
+ambos duermen 2s, ambos pasan la verificación, ambos ejecutan
+procesar_mensaje() completos. Resultado: dos respuestas, dos
+guardar_turno_en_sheets(). Si el barbero "X" tenía una sola fila
+libre, se puede escribir 2 veces la misma fila o quedar inconsistente.
+
+B) Mutación de `sesion` sin lock (api.py:769-786)
+
+    def get_sesion(user_id: str) -> dict:
+        if user_id not in sesiones:
+            sesiones[user_id] = _nueva_sesion()
+        s = sesiones[user_id]
+        if time.time() - s.get("ultimo", 0) > TIMEOUT_SESION:
+            ...
+            sesiones[user_id] = _nueva_sesion()
+        ...
+        s["ultimo"] = time.time()
+        return s
+
+No hay lock. Si dos requests del mismo user_id entran en paralelo
+(reintent de ManyChat, doble click en flow):
+  - Ambos leen s
+  - Ambos modifican s["ultimo"]
+  - Si uno resetea la sesión (timeout) y el otro no, el estado se
+    pisa. Síntoma: "a veces parece perder el estado".
+
+C) _ultimo_mensaje global (api.py:806-822)
+
+    _ultimo_mensaje: Dict[str, Tuple[str, float]] = {}
+
+Diccionario mutable global, mismo problema: dos requests del mismo
+user leen y escriben sin lock → puede que ambos pasen la dedup, o
+que ambos la salteen.
+
+D) rate_limits global (api.py:78, 130-138): misma historia. Sin lock.
+
+E) barberos_bloqueados global (api.py:79): mismo.
+
+F) bloquear_slot_cb no es atómico (sheets.py:562-618)
+
+    ok1, fila1, err1 = _guardar_turno_en_sheets(...)  # escribe slot 1
+    if not ok1 or not fila1:
+        return False
+    ok2, fila2, err2 = _guardar_turno_en_sheets(...)  # escribe slot 2
+    if ok2:
+        return True
+    # rollback del primero
+
+Entre ok1 y ok2, si llega otro request del mismo user (o de otro
+user pidiendo el mismo slot), puede sobrescribir el slot 1 sin
+contención. Google Sheets NO tiene transacciones multi-celda.
+
+
+Problemas async/sync
+--------------------
+TODOS los endpoints están declarados async def (api.py:1936, 1960,
+1988, 2018, 2028, 2083, 2095, 2116, 2122, 2138, 2155, 2166) pero
+ejecutan código 100% síncrono:
+  - groq_client.chat.completions.create(...) (sync, api.py:640)
+  - gspread (sync, todo sheets.py)
+  - time.sleep o asyncio.sleep mal usado
+
+Consecuencia real: cada llamada a Sheets (1-3s) bloquea el event
+loop completo → no se sirve ningún otro request hasta que termine.
+Si llegan 3 requests en paralelo, se procesan serializados pero los
+timeouts de ManyChat ya se cumplieron.
+
+
+Threading
+---------
+No se observa threading ni multiprocessing. Solo asyncio (mal usado).
+
+
+================================================================
+3. ESTADO
+================================================================
+
+Dónde se guarda
+---------------
+TODO en RAM (api.py:77-81):
+
+    sesiones: Dict[str, dict] = {}
+    rate_limits: Dict[str, List[float]] = {}
+    barberos_bloqueados: Dict[str, str] = {}
+    _pending_messages: Dict[str, dict] = {}
+    _ultimo_mensaje: Dict[str, Tuple[str, float]] = {}
+
+
+Railway puede perderlo
+----------------------
+SÍ, en cada uno de estos eventos:
+- Deploy: Railway reinicia el contenedor. Todo el estado perdido.
+  Sesión a la mitad = cliente manda "sí" y el bot le contesta
+  "Hola, ¿qué necesitás?" (síntoma: "parece perder el estado").
+- Autosleep (si está en plan con sleep): tras N minutos sin tráfico,
+  Railway duerme el contenedor. El próximo request tarda 5-30s en
+  arrancar (cold start) y el estado se perdió.
+- Crash / OOM: si Groq o Sheets tiran excepción no manejada en
+  startup_event o similar → el worker muere, Railway levanta uno
+  nuevo, estado limpio.
+- Múltiples workers: si alguna vez Railway escala a 2+ workers, cada
+  uno tiene su propio diccionario sesiones. Un cliente que llega al
+  worker A y luego al worker B tiene dos estados distintos
+  (síntoma: "pierde estado aleatorio"). En plan hobby normalmente
+  hay 1 worker, pero Railway puede reciclarlo.
+
+
+Riesgo de corrupción
+--------------------
+Las sesiones son diccionarios mutables. Sin lock, dos requests
+pueden pisar paso, horario, nombre al mismo tiempo.
+Ejemplo concreto: cliente manda "Juan" justo cuando está en
+esperando_nombre. Dos requests casi simultáneos. El LLM extrae
+nombre="Juan" en ambos. Ambos llaman a sesion["nombre"] = ... El
+segundo pisa al primero, pero ambos llaman a _intentar_guardar() →
+se podrían crear dos turnos con la misma sesión.
+
+
+Riesgo de reinicios
+-------------------
+ALTO. El estado de la conversación se va en cada deploy. El cliente
+que está a mitad de un agendamiento (paso esperando_nombre) ve el
+menú de nuevo y se confunde.
+
+
+================================================================
+4. DUPLICACIÓN
+================================================================
+
+¿Existe deduplicación de mensajes/eventos?
+-------------------------------------------
+Parcial, y por texto — NO por message_id:
+- api.py:806-822: dedup por (user_id, texto_lower) en ventana de 3s.
+- api.py:2049-2066: debounce de 2s que agrupa mensajes del mismo
+  user.
+
+
+¿Se verifica message_id/event_id?
+---------------------------------
+NO. El modelo MessageRequest (api.py:97-100) no tiene ese campo.
+ManyChat SÍ manda un ID único por mensaje (en el payload que se
+reenvía al external request), pero se ignora.
+
+
+Cómo implementar idempotencia mínima
+-------------------------------------
+Set en memoria con TTL:
+
+    _procesados: Dict[str, float] = {}
+    _DEDUP_TTL = 300  # 5 min
+
+    def ya_procesado(message_id: str) -> bool:
+        ahora = time.time()
+        # limpieza lazy
+        expirados = [k for k, t in _procesados.items()
+                     if ahora - t > _DEDUP_TTL]
+        for k in expirados:
+            _procesados.pop(k, None)
+        return message_id in _procesados
+
+Si MessageRequest no incluye message_id, agregalo en ManyChat
+(External Request → "Message ID" dynamic field) y al modelo
+Pydantic. Costo: 1 línea de import, ~10 líneas de código. Cero
+infraestructura.
+
+
+================================================================
+5. PERFORMANCE
+================================================================
+
+Qué bloquea (en orden de impacto)
+---------------------------------
+1. obtener_disponibilidad() (sheets.py:362-434): llama a
+   worksheet.get_all_values() (lee la hoja entera, ~50-100 filas)
+   por CADA mensaje. 2-3s por request, hasta 5× por mensaje
+   (verificación + días + slot siguiente en CB).
+2. groq_client.chat.completions.create() (api.py:640-648): 500-2000ms
+   en plan gratuito, puede ser 3-5s con cold de Groq.
+3. asyncio.sleep(2) del debounce (api.py:2057): 2s fijos.
+4. obtener_bot_activo() (api.py:2046): 1 consulta a Sheets por cada
+   request (lectura de CONFIG, cacheada 30s — esto está OK).
+5. Múltiples llamadas a obtener_horarios_disponibles() dentro de un
+   solo request (api.py:1097, 1248, 1257, 1377, 1569, 1607, 1661):
+   cada una es una llamada a Sheets.
+
+
+Qué se podría cachear
+---------------------
+- obtener_disponibilidad(dia): cachear por 5-15 segundos por día. Si
+  dos mensajes del mismo user llegan en 5s, no se vuelve a leer
+  Sheets. Ya hay _cache_config para CONFIG con TTL 30s
+  (sheets.py:195-196). Replicar el patrón para disponibilidad.
+- HORARIOS del día actual (datos que solo cambian cuando alguien
+  reserva): TTL 10-30s.
+- Resultado de Groq (mismo texto + mismo estado): TTL largo (1h) —
+  pero el LLM no es determinista al 100%, evaluá costo/beneficio.
+  Bajo impacto, mejor NO hacerlo.
+
+
+Riesgo con Google Sheets
+------------------------
+- Rate limit: gspread usa la API de Sheets, que tiene cuota de 60
+  requests por minuto por proyecto (lecturas). En una conversación
+  típica de 5 mensajes, son ~15 requests a Sheets. Con 4
+  conversaciones simultáneas: 60 requests/min → te pegás al techo.
+- Latencia: 500-1500ms por request normal, hasta 5s en cold.
+- Locking: NO hay lock optimista. Dos requests de Sheets consecutivos
+  pueden leer estados diferentes si alguien escribió entre medio
+  (síntoma: "ese horario se acaba de ocupar" sale mucho).
+
+
+Riesgo con Groq free tier
+-------------------------
+- Rate limit: 30 requests/min (free tier). En horario pico (varias
+  conversaciones a la vez) te quedás sin cuota y el bot empieza a
+  fallar al clasificar.
+- Latencia: muy variable, 500ms-5s.
+- Cold starts: la primera llamada del día puede tardar 3-5s.
+
+
+================================================================
+6. RAILWAY
+================================================================
+
+Cold starts
+-----------
+Si Railway duerme el contenedor (autosleep en planes free/hobby):
+5-30 segundos para responder al primer request. ManyChat ya
+timeout-eó. Mitigación mínima: un cron o servicio externo que haga
+GET /health cada 5-10 minutos (UptimeRobot, free tier, ping cada 5
+min es suficiente en la mayoría de planes).
+
+
+Múltiples workers
+-----------------
+Con 1 worker (plan hobby típico): el estado en RAM es "consistente"
+mientras el contenedor no se reinicie.
+Con 2+ workers: estado partido. El worker A tiene la sesión del
+cliente, el worker B la crea de nuevo. No hay nada en el código que
+lo prevenga (no hay Redis, no hay locks distribuidos).
+
+
+Autosleep
+---------
+Planes con sleep: tras N minutos sin tráfico, Railway apaga el
+contenedor. Próximo request = cold start. El síntoma "a veces no
+responde" está correlacionado con esto: llega un request, Railway
+arranca el contenedor (5-30s), ManyChat timeout, ManyChat reintenta,
+y cuando finalmente el worker responde, el cliente ya se fue o el
+reintento está colisionando con el primer request.
+
+
+Restart
+-------
+- Cada git push redeploy = restart = estado perdido.
+- Cada crash (excepción no manejada, OOM por el LLM, error de Sheets)
+  = restart.
+- No hay restart_policy ni health check estricto que Railway use
+  para saber si el contenedor está sano. El GET /health (api.py:2017)
+  no chequea Groq ni Sheets — siempre devuelve ok aunque Groq esté
+  caído.
+
+
+================================================================
+7. LOGS
+================================================================
+
+Qué logs faltan
+---------------
+1. Correlation ID: no hay un ID único por request. Imposible seguir
+   un mensaje de un cliente específico a través de las múltiples
+   llamadas a Sheets/Groq.
+2. Duración por request: no se loguea cuánto tardó cada paso
+   (debounce, Groq, Sheets, total). Imposible saber dónde se va el
+   tiempo.
+3. Resultado de dedup/debounce: no se loguea cuántas veces se
+   silenció un mensaje (para detectar que muchos problemas "no
+   responde" son en realidad "se silenció").
+4. Llamadas a Sheets/Groq con su duración individual.
+5. Tamaño de sesiones (cuántos users activos hay en RAM).
+6. message_id que llegó (para debug de duplicación).
+
+
+Qué métricas medir
+-------------------
+- Latencia P50/P95 de /message total.
+- Latencia P50/P95 de obtener_disponibilidad().
+- Latencia P50/P95 de groq_client.chat.completions.create().
+- Conteo de requests por user_id por minuto (para detectar
+  spam/reintentos).
+- Conteo de BOT_SILENCIADO por hora (si es alto, hay duplicación).
+- Conteo de guardar_turno_en_sheets() con resultado False (síntoma
+  de race).
+- Conteo de cancelar_turno() con error.
+- Conteo de excepciones en groq.
+- Tamaño del diccionario sesiones (para detectar leak).
+
+
+Cómo detectar el problema real
+------------------------------
+- Si "no responde" se concentra tras deploys/sleeps → cold start,
+  falta keep-alive.
+- Si "duplica" se correlaciona con latencia > 5s → timeout de
+  ManyChat, falta dedup por message_id.
+- Si "pierde estado" se correlaciona con deploys → estado en RAM,
+  considerar persistencia mínima en Sheets.
+- Si "duplica" se ve en logs como "guardar_turno: ok" duplicado →
+  race en bloquear_slot_cb o debounce.
+
+
+================================================================
+8. PRIORIDADES — TOP 5
+================================================================
+
+🔴 #1 — Debounce con sleep bloqueante + falta de dedup por message_id
+   Impacto: "responde duplicado", "procesa dos veces el mismo
+   mensaje", "no responde" (cuando el sleep + latencia superan el
+   timeout de ManyChat).
+   Evidencia: api.py:2049-2066 (debounce), api.py:97-100 (modelo sin
+   message_id), api.py:806-822 (dedup solo por texto).
+   Dificultad: Baja.
+   Solución mínima:
+     1. Agregar message_id: Optional[str] = None a MessageRequest.
+     2. Pasar message_id desde ManyChat (External Request).
+     3. Set _procesados: Dict[str, float] con TTL 300s; si message_id
+        está, devolver 200 OK sin procesar.
+     4. Quitar el asyncio.sleep(2) (es lo que causa los timeouts).
+        Si querés debounce, hacelo en ManyChat (configurá "wait for
+        user input" 1s en el flow).
+   Riesgo del fix: muy bajo. Solo se cambia el comportamiento cuando
+   hay message_id duplicado. Si ManyChat no manda message_id, el bot
+   sigue funcionando como hoy (con un warning en log).
+
+🔴 #2 — Estado de sesión 100% en RAM + race conditions
+   Impacto: "pierde el estado" (deploy, autosleep, crash) +
+   "responde duplicado" (race entre dos requests paralelos del mismo
+   user).
+   Evidencia: api.py:77-81 (diccionarios globales), api.py:769-786
+   (get_sesion sin lock), api.py:806-822 (dedup sin lock).
+   Dificultad: Media.
+   Solución mínima:
+     1. Lock por user_id: import asyncio; _locks: Dict[str,
+        asyncio.Lock] = {}. Adquirir lock al inicio de handle_message
+        para ese user_id. Liberar al final.
+     2. Persistencia mínima de la sesión crítica (paso, servicio,
+        dia, barbero, horario, nombre) en una pestaña "SESIONES" de
+        Sheets, con TTL. Al recibir un request, leer de Sheets. NO
+        requiere Redis ni infraestructura nueva — usa lo que ya
+        tenés (Sheets).
+   Riesgo del fix: medio. Si tocás la lógica de lectura/escritura
+   mal, podés romper el flujo. Probá primero solo el lock por
+   user_id; la persistencia en Sheets es opcional y más invasiva.
+
+🟠 #3 — Handlers async def ejecutando código 100% síncrono
+   Impacto: "no responde" cuando hay varias conversaciones
+   simultáneas (cada request bloquea el event loop 3-8s, las demás
+   esperan).
+   Evidencia: api.py:2027-2079 (async con código sync),
+   sheets.py:373, 517, 522 (gspread sync), api.py:640-648 (Groq
+   sync).
+   Dificultad: Baja.
+   Solución mínima: cambiar a def (síncrono) y subir workers de
+   Uvicorn con --workers 1 --loop uvloop (sin gunicorn). Uvicorn
+   maneja requests sync sin bloquear "el event loop" porque cada
+   request corre en su propio thread. O usar asyncio.to_thread()
+   para envolver las llamadas sync dentro de los handlers async.
+   Cualquiera de las dos es 1-2 líneas.
+   Riesgo del fix: bajo. El comportamiento es idéntico, solo se
+   quita la mentira del async def.
+
+🟠 #4 — Múltiples llamadas a obtener_disponibilidad() por request
+   Impacto: "no responde" cuando se llega al rate limit (60 req/min)
+   o en cold de Sheets; latencia alta sostenida.
+   Evidencia: sheets.py:362-434 (lee la hoja entera), api.py:1097,
+   1248, 1257, 1377, 1569, 1607, 1661 (múltiples llamadas por
+   request).
+   Dificultad: Baja.
+   Solución mínima: agregar cache en memoria tipo _cache_config para
+   obtener_disponibilidad(dia) con TTL 10-15 segundos. Una
+   conversación de 5 mensajes que pide el mismo día = 1 lectura de
+   Sheets en vez de 5-10.
+   Riesgo del fix: bajo. La disponibilidad puede quedar
+   desactualizada 10-15s — en una barbería, irrelevante.
+
+🟡 #5 — groq_client sin timeout ni manejo de rate limit
+   Impacto: "no responde" cuando Groq está lento o se acabaron las
+   30 req/min del free tier. Un request puede colgar 10-30s.
+   Evidencia: api.py:640-648 (sin timeout), api.py:75 (Groq client
+   sin options).
+   Dificultad: Baja.
+   Solución mínima:
+     1. groq_client = Groq(api_key=..., timeout=5.0) (timeout 5s en
+        el cliente).
+     2. Si Groq falla o timeout, caer al detector determinístico con
+        intencion="otro" y mensaje "no entendí, reformulá". Ya hay
+        manejo de excepción en clasificar_con_llm (api.py:655-657) —
+        el try no cubre timeouts de red.
+   Riesgo del fix: muy bajo. Solo se acota el peor caso.
+
+
+================================================================
+RESUMEN EJECUTIVO
+================================================================
+
+Qué tocar primero (mejor relación impacto/riesgo)
+-------------------------------------------------
+1. Quitar el asyncio.sleep(2) del debounce (api.py:2057).
+   Reemplazarlo por dedup por message_id en set con TTL. — 10
+   líneas, 0 riesgo.
+2. Cachear obtener_disponibilidad(dia) con TTL 10-15s en sheets.py.
+   — 10 líneas, 0 riesgo.
+3. Setear timeout=5.0 en el cliente de Groq. — 1 línea, 0 riesgo.
+4. Cambiar los handlers de async def a def (ya que hacen solo
+   sync). — 1 línea por handler, 0 riesgo.
+
+Esos 4 cambios son ~30 líneas en total y atacan las 3 causas más
+probables de "no responde" y "duplica".
+
+
+Qué NO tocar todavía
+---------------------
+- No migrar a Redis, PostgreSQL ni a una arquitectura de workers. No
+  es el problema. El problema es 30 líneas de fixes mínimos.
+- No reescribir la máquina de estados (_flujo, api.py:1153-1524).
+  Funciona, está probada. Reescribirla es donde se introducen bugs.
+- No cambiar el patrón de detectar_servicio/detectar_dia/etc. Es
+  robusto y determinístico — no toques lo que anda.
+- No agregar autenticación de ManyChat por firma (HMAC, etc.) salvo
+  que sea un pedido explícito. El bearer key ya alcanza.
+- No tocar la lógica de Sheets (sheets.py) salvo el cache. La
+  lógica de bloques horarios es compleja y está probada.
+
+
+Cambios con mejor relación impacto/riesgo
+------------------------------------------
+  Cambio                                       Líneas  Impacto  Riesgo
+  -------------------------------------------- ------  -------  ------
+  Quitar debounce sleep, dedup por message_id   ~15    Alto     Nulo
+  Cache de disponibilidad 10-15s                ~10    Medio    Nulo
+  Timeout 5s en Groq client                      ~2    Medio    Nulo
+  async def → def en handlers                   ~10    Medio    Nulo
+  Lock por user_id en handle_message             ~5    Medio    Bajo
+  Logs de duración por paso                      ~20    Bajo*    Nulo
+  * habilita diagnóstico futuro
+
+
+Sospechosos NO confirmados (no verificable sin logs reales)
+-----------------------------------------------------------
+- ¿Groq free tier está cerca del rate limit? No verificable desde
+  el código. Necesita métricas en producción.
+- ¿Railway está en plan con autosleep? No verificable. Preguntale
+  al usuario / revisá el dashboard.
+- ¿Cuántos workers tiene configurados? Asumido 1 (default Railway).
+  Si tiene más, el problema de estado en RAM se multiplica.
+- ¿Cuánto tarda la latencia Sheets P95 hoy? No medido. Sin logs de
+  duración, es adivinar.
