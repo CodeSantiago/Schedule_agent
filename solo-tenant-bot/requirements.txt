@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-groq
-python-dotenv
-gspread
-google-auth
-redis
