@@ -260,4 +260,4 @@ Still evolving:
 
 This repository does not include real client data, secrets, production credentials, private conversations, or confidential operational logic. The public codebase is a sanitized adaptation intended to show the architecture, product thinking, and technical tradeoffs behind the scheduling agent.
 
-`solo-tenant-bot/` is preserved only as legacy reference material. New code should not import from it.
+
